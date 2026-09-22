@@ -14,7 +14,7 @@ import logging
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
-from datasets.crowd import Crowd
+from datasets.crowd import Crowd, PairedCrowd
 from losses.bay_loss import Bay_Loss
 from losses.post_prob import Post_Prob
 from math import ceil
@@ -27,6 +27,14 @@ def train_collate(batch):
     targets = transposed_batch[2]
     st_sizes = torch.FloatTensor(transposed_batch[3])
     return images, points, targets, st_sizes
+
+
+def paired_train_collate(batch):
+    day_images, night_images, points, targets, st_sizes = zip(*batch)
+    return (
+        torch.stack(day_images), torch.stack(night_images), points, targets,
+        torch.as_tensor(st_sizes, dtype=torch.float32),
+    )
 
 
 class RegTrainer(Trainer):
@@ -54,9 +62,12 @@ class RegTrainer(Trainer):
             raise ValueError('--val-start and --val-epoch must be positive')
         if args.dora_val_start is not None and args.dora_val_start <= 0:
             raise ValueError('--dora-val-start must be positive')
+        if args.pair_loss_weight < 0:
+            raise ValueError('--pair-loss-weight must be nonnegative')
         self.start_epoch = 0
         resume_optimizer_state = None
         self.phase = 'pretrain'
+        self.teacher = None
         self.best_mae = np.inf
         self.best_mse = np.inf
         self.best_model_path = None
@@ -77,6 +88,21 @@ class RegTrainer(Trainer):
                     raise ValueError('cannot resume DoRA training with --no-dora')
                 if self.phase == 'dora':
                     self.model.train_dora_only()
+                    teacher_state = checkpoint.get('teacher_state_dict')
+                    if teacher_state is None:
+                        logging.warning(
+                            'Legacy DoRA checkpoint has no stored day teacher; '
+                            'reconstructing it from frozen base weights'
+                        )
+                        teacher_state = self.plain_state_from_dora(state_dict)
+                    self.teacher = self.make_teacher(teacher_state)
+                    saved_weight = checkpoint.get('pair_loss_weight')
+                    if (saved_weight is not None
+                            and saved_weight != args.pair_loss_weight):
+                        raise ValueError(
+                            'resume pair-loss-weight differs from checkpoint: '
+                            '{} != {}'.format(args.pair_loss_weight, saved_weight)
+                        )
                 self.best_mae = checkpoint.get('best_mae', np.inf)
                 self.best_mse = checkpoint.get('best_mse', np.inf)
                 best_name = '{}_best_model.pth'.format(self.phase)
@@ -124,6 +150,7 @@ class RegTrainer(Trainer):
             self.model.load_state_dict(state_dict)
             if args.use_dora:
                 self.phase = 'dora'
+                self.teacher = self.make_teacher(state_dict)
                 self.model.enable_dora(args.dora_rank, args.dora_alpha)
                 self.model.train_dora_only()
         else:
@@ -147,7 +174,7 @@ class RegTrainer(Trainer):
         self.set_dataloaders_for_phase()
         if self.phase == 'pretrain' and args.use_dora and args.dora_data_dir:
             # Validate the second dataset before the potentially long pretrain.
-            self.build_datasets(args.dora_data_dir)
+            self.build_dora_datasets(args.dora_data_dir)
 
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
@@ -169,9 +196,28 @@ class RegTrainer(Trainer):
         self.writer = SummaryWriter(os.path.join(self.save_dir, 'tensorboard'))
 
     def phase_data_dir(self):
-        if self.phase == 'dora' and self.args.dora_data_dir:
+        if self.phase == 'dora':
+            if not self.args.dora_data_dir:
+                raise ValueError('--dora-data-dir must point to paired night images')
             return self.args.dora_data_dir
         return self.args.data_dir
+
+    def make_teacher(self, state_dict):
+        teacher = models.swin_t_trans(pretrained=False, use_dora=False)
+        teacher.load_state_dict(state_dict)
+        teacher.requires_grad_(False)
+        return teacher.to(self.device).eval()
+
+    @staticmethod
+    def plain_state_from_dora(state_dict):
+        plain_state = {}
+        for key, value in state_dict.items():
+            if key.endswith(('.lora_A', '.lora_B', '.magnitude', '.alpha')):
+                continue
+            key = key.replace('.attn.qkv.base_layer.', '.attn.qkv.')
+            key = key.replace('.attn.proj.base_layer.', '.attn.proj.')
+            plain_state[key] = value
+        return plain_state
 
     def build_datasets(self, data_dir):
         args = self.args
@@ -191,15 +237,43 @@ class RegTrainer(Trainer):
                 )
         return datasets
 
+    def build_dora_datasets(self, night_data_dir):
+        args = self.args
+        datasets = {
+            'train': PairedCrowd(
+                os.path.join(args.data_dir, 'train'),
+                os.path.join(night_data_dir, 'train'),
+                args.crop_size, args.downsample_ratio, args.is_gray,
+            ),
+            'val': Crowd(
+                os.path.join(night_data_dir, 'val'), args.crop_size,
+                args.downsample_ratio, args.is_gray, 'val',
+            ),
+        }
+        for split, dataset in datasets.items():
+            if len(dataset) == 0:
+                raise ValueError(
+                    'no valid {} images in DoRA dataset: {}'.format(
+                        split, os.path.join(night_data_dir, split)
+                    )
+                )
+        return datasets
+
     def set_dataloaders_for_phase(self):
         args = self.args
         data_dir = self.phase_data_dir()
         logging.info('{} data directory: {}'.format(self.phase, data_dir))
-        self.datasets = self.build_datasets(data_dir)
+        self.datasets = (
+            self.build_dora_datasets(data_dir)
+            if self.phase == 'dora' else self.build_datasets(data_dir)
+        )
         self.dataloaders = {
             split: DataLoader(
                 self.datasets[split],
-                collate_fn=(train_collate if split == 'train' else default_collate),
+                collate_fn=(
+                    paired_train_collate if split == 'train' and self.phase == 'dora'
+                    else train_collate if split == 'train' else default_collate
+                ),
                 batch_size=(args.batch_size if split == 'train' else 1),
                 shuffle=(split == 'train'),
                 num_workers=args.num_workers * self.device_count,
@@ -250,6 +324,7 @@ class RegTrainer(Trainer):
         logging.info('Loading best pretrain model: {}'.format(self.best_model_path))
         state_dict = torch.load(self.best_model_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
+        self.teacher = self.make_teacher(state_dict)
         self.model.enable_dora(self.args.dora_rank, self.args.dora_alpha)
         self.model.train_dora_only()
         self.model.to(self.device)
@@ -272,7 +347,8 @@ class RegTrainer(Trainer):
     def train_eopch(self):
         epoch_loss = AverageMeter()
         epoch_bayesian_loss = AverageMeter()
-        epoch_consistency_loss = AverageMeter()
+        epoch_aux_loss = AverageMeter()
+        aux_name = 'pair_loss' if self.phase == 'dora' else 'consistency_loss'
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
@@ -291,7 +367,12 @@ class RegTrainer(Trainer):
             ),
             dynamic_ncols=True,
         )
-        for step, (inputs, points, targets, st_sizes) in train_bar:
+        for step, batch in train_bar:
+            if self.phase == 'dora':
+                day_inputs, inputs, points, targets, st_sizes = batch
+                day_inputs = day_inputs.to(self.device)
+            else:
+                inputs, points, targets, st_sizes = batch
             inputs = inputs.to(self.device)
             st_sizes = st_sizes.to(self.device)
             gd_count = np.array([len(p) for p in points], dtype=np.float32)
@@ -299,20 +380,37 @@ class RegTrainer(Trainer):
             targets = [t.to(self.device) for t in targets]
 
             with torch.set_grad_enabled(True):
-                outputs, features = self.model(inputs)
+                if self.phase == 'dora':
+                    with torch.no_grad():
+                        day_feature = self.teacher.extract_backbone_feature(
+                            day_inputs
+                        )
+                    outputs, _, night_feature = self.model(
+                        inputs, return_backbone_feature=True
+                    )
+                    if day_feature.shape != night_feature.shape:
+                        raise ValueError('paired feature shapes do not match')
+                    aux_loss = (
+                        1 - F.cosine_similarity(
+                            day_feature, night_feature, dim=-1, eps=1e-6
+                        )
+                    ).mean()
+                else:
+                    outputs, features = self.model(inputs)
+                    aux_loss = outputs.new_zeros(())
+                    for layer_features in features:
+                        # Average over the batch without mixing image tokens.
+                        mean_feature = layer_features.mean(dim=1, keepdim=True)
+                        cosine = 1 - F.cosine_similarity(
+                            layer_features, mean_feature, dim=2, eps=1e-5
+                        )
+                        aux_loss += cosine.sum(dim=1).mean()
                 prob_list = self.post_prob(points, st_sizes)
                 bayesian_loss = self.criterion(prob_list, targets, outputs)
-                loss_c = outputs.new_zeros(())
-                for layer_features in features:
-                    # [batch, tokens, channels]. Preserve the original sum over
-                    # tokens, but average over the batch so its scale does not
-                    # depend on batch size.
-                    mean_feature = layer_features.mean(dim=1, keepdim=True)
-                    cosine = 1 - F.cosine_similarity(
-                        layer_features, mean_feature, dim=2, eps=1e-5
-                    )
-                    loss_c += cosine.sum(dim=1).mean()
-                loss = bayesian_loss + loss_c
+                aux_weight = (
+                    self.args.pair_loss_weight if self.phase == 'dora' else 1.0
+                )
+                loss = bayesian_loss + aux_weight * aux_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -323,7 +421,7 @@ class RegTrainer(Trainer):
                 res = pre_count - gd_count
                 epoch_loss.update(loss.item(), N)
                 epoch_bayesian_loss.update(bayesian_loss.item(), N)
-                epoch_consistency_loss.update(loss_c.item(), N)
+                epoch_aux_loss.update(aux_loss.item(), N)
                 epoch_mse.update(np.mean(res * res), N)
                 epoch_mae.update(np.mean(abs(res)), N)
 
@@ -338,18 +436,18 @@ class RegTrainer(Trainer):
                         self.global_step,
                     )
                     self.writer.add_scalar(
-                        '{}/train_step/consistency_loss'.format(self.phase),
-                        loss_c.item(),
+                        '{}/train_step/{}'.format(self.phase, aux_name),
+                        aux_loss.item(),
                         self.global_step,
                     )
 
-                train_bar.set_postfix(
-                    loss='{:.3f}'.format(loss.item()),
-                    bayes='{:.3f}'.format(bayesian_loss.item()),
-                    consistency='{:.3f}'.format(loss_c.item()),
-                    mae='{:.2f}'.format(np.mean(abs(res))),
-                    lr='{:.2e}'.format(self.optimizer.param_groups[0]['lr']),
-                )
+                train_bar.set_postfix(**{
+                    'loss': '{:.3f}'.format(loss.item()),
+                    'bayes': '{:.3f}'.format(bayesian_loss.item()),
+                    aux_name: '{:.3f}'.format(aux_loss.item()),
+                    'mae': '{:.2f}'.format(np.mean(abs(res))),
+                    'lr': '{:.2e}'.format(self.optimizer.param_groups[0]['lr']),
+                })
                 self.global_step += 1
 
         train_rmse = np.sqrt(epoch_mse.get_avg())
@@ -361,8 +459,8 @@ class RegTrainer(Trainer):
             epoch_bayesian_loss.get_avg(), self.epoch
         )
         self.writer.add_scalar(
-            '{}/train/consistency_loss'.format(self.phase),
-            epoch_consistency_loss.get_avg(),
+            '{}/train/{}'.format(self.phase, aux_name),
+            epoch_aux_loss.get_avg(),
             self.epoch,
         )
         self.writer.add_scalar(
@@ -375,12 +473,13 @@ class RegTrainer(Trainer):
 
         logging.info(
             'Epoch {} Train, Loss: {:.2f}, Bayesian Loss: {:.2f}, '
-            'Consistency Loss: {:.2f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
+            '{}: {:.2f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
             .format(
                 self.epoch,
                 epoch_loss.get_avg(),
                 epoch_bayesian_loss.get_avg(),
-                epoch_consistency_loss.get_avg(),
+                aux_name,
+                epoch_aux_loss.get_avg(),
                 train_rmse,
                 epoch_mae.get_avg(),
                 time.time()-epoch_start,
@@ -398,9 +497,22 @@ class RegTrainer(Trainer):
             'use_dora': self.model.use_dora,
             'dora_rank': self.model.dora_rank if self.model.use_dora else None,
             'dora_alpha': self.model.dora_alpha if self.model.use_dora else None,
-            'best_mae': self.best_mae,
-            'best_mse': self.best_mse,
+            'best_mae': float(self.best_mae),
+            'best_mse': float(self.best_mse),
             'global_step': self.global_step,
+            'pair_loss_weight': (
+                self.args.pair_loss_weight if self.phase == 'dora' else None
+            ),
+            'paired_day_data_dir': (
+                self.args.data_dir if self.phase == 'dora' else None
+            ),
+            'paired_night_data_dir': (
+                self.args.dora_data_dir if self.phase == 'dora' else None
+            ),
+            'pair_rule': 'IMG_n.jpg <-> night_IMG_n.jpg',
+            'teacher_state_dict': (
+                self.teacher.state_dict() if self.phase == 'dora' else None
+            ),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'model_state_dict': self.model.state_dict(),
         }, save_path)

@@ -26,11 +26,11 @@ def parse_args():
                         help='pretrain data directory (with train/ and val/)')
     parser.add_argument('--max-model-num', type=int, default=1,
                         help='max models num to save ')
-    parser.add_argument('--max-epoch', type=int, default=600,
+    parser.add_argument('--max-epoch', type=int, default=10,
                         help='number of pretrain epochs')
     parser.add_argument('--val-epoch', type=int, default=5,
                         help='validate every N epochs (1-based)')
-    parser.add_argument('--val-start', type=int, default=200,
+    parser.add_argument('--val-start', type=int, default=5,
                         help='first pretrain epoch eligible for validation (1-based)')
     
     parser.add_argument('--no-dora', dest='use_dora', action='store_false',
@@ -40,11 +40,13 @@ def parse_args():
                         help='rank of each Swin attention DoRA layer')
     parser.add_argument('--dora-alpha', type=float, default=8.0,
                         help='scaling numerator for each DoRA layer')
-    parser.add_argument('--dora-data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix',
+    parser.add_argument('--dora-data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/night',
                         help='DoRA data directory (with train/ and val/)')
-    parser.add_argument('--dora-epochs', type=int, default=1200,
+    parser.add_argument('--pair-loss-weight', type=float, default=1.0,
+                        help='weight of day/night paired cosine loss in DoRA training')
+    parser.add_argument('--dora-epochs', type=int, default=10,
                         help='number of DoRA-only epochs after pretrain')
-    parser.add_argument('--dora-val-start', type=int, default=600,
+    parser.add_argument('--dora-val-start', type=int, default=5,
                         help='first DoRA epoch eligible for validation; defaults to --val-start')
 
     parser.add_argument('--batch-size', type=int, default=4,

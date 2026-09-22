@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 from PIL import Image
+import numpy as np
 
+from datasets.crowd import Crowd, PairedCrowd
 from models.dora import DoRALinear
 from models.swin_c_multibatch import swin_t_trans, swin_t_trans_from_state_dict
+from utils.helper import Save_Handle
 from utils.regression_trainer_cosine_multibatch import RegTrainer
 
 
@@ -46,6 +49,10 @@ class SwinDoRATests(unittest.TestCase):
         self.assertEqual(tuple(density.shape), (2, 1, 4, 4))
         self.assertEqual([tuple(feature.shape) for feature in features],
                          [(2, 4, 512), (2, 4, 512)])
+        with torch.no_grad():
+            _, _, stage4 = model(torch.randn(2, 3, 64, 64),
+                                 return_backbone_feature=True)
+        self.assertEqual(tuple(stage4.shape), (2, 2, 2, 768))
 
     def test_checkpoint_reconstructs_dora_and_plain_models(self):
         adapted = swin_t_trans(pretrained=False, use_dora=True, dora_rank=4,
@@ -57,6 +64,14 @@ class SwinDoRATests(unittest.TestCase):
 
         plain = swin_t_trans(pretrained=False, use_dora=False)
         self.assertFalse(swin_t_trans_from_state_dict(plain.state_dict()).use_dora)
+
+        recovered_base = RegTrainer.plain_state_from_dora(adapted.state_dict())
+        teacher = swin_t_trans(pretrained=False, use_dora=False)
+        teacher.load_state_dict(recovered_base)
+        self.assertTrue(torch.equal(
+            teacher.backbone_features[1][0].attn.qkv.weight,
+            adapted.backbone_features[1][0].attn.qkv.base_layer.weight,
+        ))
 
     def test_pretrain_to_dora_only_transition(self):
         plain = swin_t_trans(pretrained=False, use_dora=False)
@@ -84,6 +99,9 @@ class SwinDoRATests(unittest.TestCase):
 
         self.assertEqual(trainer.phase, 'dora')
         self.assertEqual(loader_phases, ['dora'])
+        self.assertIsNotNone(trainer.teacher)
+        self.assertFalse(trainer.teacher.training)
+        self.assertTrue(all(not p.requires_grad for p in trainer.teacher.parameters()))
         self.assertTrue(torch.equal(
             trainer.model.backbone_features[1][0].attn.qkv.base_layer.weight,
             best_weight,
@@ -157,17 +175,25 @@ class SwinDoRATests(unittest.TestCase):
         trainer.phase = 'dora'
         self.assertEqual(trainer.phase_data_dir(), '/data/night')
         trainer.args.dora_data_dir = None
-        self.assertEqual(trainer.phase_data_dir(), '/data/day')
+        with self.assertRaises(ValueError):
+            trainer.phase_data_dir()
 
     def test_dora_dataloaders_use_separate_train_and_val_folders(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dora_dir = os.path.join(tmpdir, 'night')
+            day_train = os.path.join(tmpdir, 'day', 'train')
+            os.makedirs(day_train)
             for split in ('train', 'val'):
                 split_dir = os.path.join(dora_dir, split)
                 os.makedirs(split_dir)
                 Image.new('RGB', (16, 16)).save(
-                    os.path.join(split_dir, 'sample.jpg')
+                    os.path.join(split_dir, 'night_IMG_1.jpg')
                 )
+            Image.new('RGB', (16, 16)).save(
+                os.path.join(day_train, 'IMG_1.jpg')
+            )
+            np.save(os.path.join(dora_dir, 'train', 'night_IMG_1.npy'),
+                    np.empty((0, 3)))
             trainer = RegTrainer.__new__(RegTrainer)
             trainer.args = SimpleNamespace(
                 data_dir=os.path.join(tmpdir, 'day'), dora_data_dir=dora_dir,
@@ -185,6 +211,60 @@ class SwinDoRATests(unittest.TestCase):
             )
             self.assertEqual(trainer.dataloaders['train'].batch_size, 2)
             self.assertEqual(trainer.dataloaders['val'].batch_size, 1)
+
+    def test_paired_images_share_geometry_and_ignore_appledouble(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            day_dir = os.path.join(tmpdir, 'day')
+            night_dir = os.path.join(tmpdir, 'night')
+            os.makedirs(day_dir)
+            os.makedirs(night_dir)
+            pixels = np.arange(128 * 128, dtype=np.uint8).reshape(128, 128)
+            image = Image.fromarray(np.stack([pixels] * 3, axis=-1))
+            image.save(os.path.join(day_dir, 'IMG_1.jpg'))
+            image.save(os.path.join(night_dir, 'night_IMG_1.jpg'))
+            np.save(os.path.join(night_dir, 'night_IMG_1.npy'),
+                    np.array([[64., 64., 16.]]))
+            with open(os.path.join(day_dir, '._IMG_1.jpg'), 'wb') as file:
+                file.write(b'not an image')
+            self.assertEqual(len(Crowd(day_dir, 64, 16)), 1)
+
+            dataset = PairedCrowd(day_dir, night_dir, 64, 16)
+            day, night, points, targets, _ = dataset[0]
+            self.assertTrue(torch.equal(day, night))
+            self.assertEqual(tuple(day.shape), (3, 64, 64))
+            self.assertEqual(points.shape[-1], 2)
+            self.assertEqual(points.shape[0], targets.shape[0])
+
+    def test_dora_checkpoint_stores_teacher_and_pair_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = RegTrainer.__new__(RegTrainer)
+            trainer.args = SimpleNamespace(
+                model_name='swin_t_trans', pair_loss_weight=1.0,
+                data_dir='/data/day', dora_data_dir='/data/night',
+            )
+            trainer.save_dir = tmpdir
+            trainer.phase = 'dora'
+            trainer.epoch = 2
+            trainer.epoch_index = 1
+            trainer.best_mae = np.float64(3.0)
+            trainer.best_mse = np.float64(4.0)
+            trainer.global_step = 10
+            trainer.model = nn.Linear(2, 2)
+            trainer.model.use_dora = True
+            trainer.model.dora_rank = 8
+            trainer.model.dora_alpha = 8.0
+            trainer.teacher = nn.Linear(2, 2)
+            trainer.optimizer = torch.optim.Adam(trainer.model.parameters())
+            trainer.save_list = Save_Handle(max_num=1)
+            trainer.save_checkpoint()
+
+            checkpoint = torch.load(
+                os.path.join(tmpdir, 'dora_2_ckpt.tar'), weights_only=True
+            )
+            self.assertEqual(checkpoint['best_mae'], 3.0)
+            self.assertEqual(checkpoint['pair_loss_weight'], 1.0)
+            self.assertIn('weight', checkpoint['teacher_state_dict'])
+            self.assertEqual(checkpoint['paired_night_data_dir'], '/data/night')
 
 
 if __name__ == '__main__':

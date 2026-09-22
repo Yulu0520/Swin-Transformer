@@ -88,13 +88,17 @@ class SwinTransMultiBatch(nn.Module):
                 module.lora_B.requires_grad_(True)
                 module.magnitude.requires_grad_(True)
 
-    def forward(self, x):
+    def extract_backbone_feature(self, x):
+        """Spatial stage-4 feature, channels last: [B, H/32, W/32, 768]."""
+        return self.backbone_norm(self.backbone_features(x))
+
+    def forward(self, x, return_backbone_feature=False):
         input_h, input_w = x.shape[-2:]
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
-        x = self.backbone_norm(x)
+        backbone_feature = self.extract_backbone_feature(x)
+        x = backbone_feature
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
 
@@ -109,6 +113,8 @@ class SwinTransMultiBatch(nn.Module):
             x, size=density_size, mode="bilinear", align_corners=False
         )
         density = self.reg_layer_0(x)
+        if return_backbone_feature:
+            return torch.relu(density), consistency_features, backbone_feature
         return torch.relu(density), consistency_features
 
 

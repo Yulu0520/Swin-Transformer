@@ -14,6 +14,14 @@ inserted into the `qkv` and output `proj` Linear layers of all 12 Swin-T
 attention blocks (24 DoRA modules). During the DoRA stage, every other model
 parameter is frozen. No MoE module is used.
 
+DoRA training pairs `day/train/IMG_n.jpg` with
+`night/train/night_IMG_n.jpg` and uses `night_IMG_n.npy` for counting.
+Both images receive identical geometric augmentation. A frozen, eval-mode
+copy of the best pretrain model extracts the day stage-4 feature; the DoRA
+model extracts the night feature and predicts the night density map. The DoRA
+loss is `Bayesian_night + pair_loss_weight * paired_cosine`. Validation uses
+night images only. Files named `._*.jpg` are ignored.
+
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
 ![image](structure.png)
@@ -22,7 +30,7 @@ parameter is frozen. No MoE module is used.
 1. Install dependencies with `pip install -r requirements.txt`.
 2. Dowload Dataset JHU++ or UCF-QNRF.
 3. Preprocess them with `preprocess_dataset_jhu.py` or `preprocess_dataset_ucf.py`.
-4. Run `python train.py --data-dir <pretrain-root> --dora-data-dir <dora-root> --batch-size 2 --max-epoch 10 --dora-epochs 10`.
+4. Run `python train.py --data-dir <day-root> --dora-data-dir <night-root> --batch-size 2 --max-epoch 10 --dora-epochs 10 --pair-loss-weight 1.0`.
 5. Wait patiently for the program to finish.
 6. Then you will get a good counting model!
 
@@ -31,11 +39,12 @@ training run. Pass `--no-pretrained-backbone` to disable this. Old VGG19
 checkpoints are not compatible with the Swin-T model.
 
 `--max-epoch` controls pretrain, and `--dora-epochs` controls DoRA-only
-training. Both default to 10. `--data-dir` supplies pretrain `train/` and
-`val/` folders; `--dora-data-dir` independently supplies the DoRA-stage
-`train/` and `val/` folders. The current `train.py` defaults point to the
-local SHA `day` and `mix` datasets respectively; pass both paths explicitly
-for another setup. DoRA rank and alpha default to 8; change them
+training. `--data-dir` supplies day `train/` and `val/` folders;
+`--dora-data-dir` supplies the paired night `train/` and night-only `val/`
+folders. The current `train.py` defaults point to the local SHA `day` and
+`night` datasets; pass both paths explicitly for another setup. DoRA's
+`--pair-loss-weight` defaults to 1.0 and should be tuned using the separate
+Bayesian and pair-loss metrics. DoRA rank and alpha default to 8; change them
 with `--dora-rank` and `--dora-alpha`. Use `--no-dora` for pretrain only. To
 skip pretrain and begin DoRA-only training from an already trained,
 **non-DoRA** Swin-MAN checkpoint, pass `--init-checkpoint <checkpoint.pth>`.
@@ -43,6 +52,7 @@ Use `--resume <phase_epoch_ckpt.tar>` to resume a stage. The best pretrain
 checkpoint is `pretrain_best_model.pth`; the best DoRA checkpoint is
 `dora_best_model.pth`, also available as `best_model.pth`. The final epoch of
 each stage is always validated, even if it is outside the validation schedule.
+DoRA `.tar` checkpoints include the frozen day teacher for reliable resuming.
 Test and visualization scripts detect DoRA from the checkpoint automatically.
 
 Training and validation progress are displayed with tqdm. TensorBoard scalar
@@ -52,12 +62,10 @@ logs are stored in `model/<run>/tensorboard/` and can be viewed with:
 tensorboard --logdir model
 ```
 
-TensorBoard metrics are grouped under `pretrain/` and `dora/`. Epoch numbers
-in each stage start at 1. For example, `--max-epoch 10 --dora-epochs 10
---val-start 5 --val-epoch 5` runs 10 pretrain epochs followed by 10 DoRA-only
-epochs, validating at epochs 5 and 10 in each stage. Set `--dora-val-start`
-to use a different first validation epoch for DoRA; if omitted, it inherits
-`--val-start`. The validation interval `--val-epoch` is shared by both stages.
+TensorBoard metrics are grouped under `pretrain/` and `dora/`. DoRA records
+Bayesian, pair, and total loss along with counting metrics. Epoch numbers in
+each stage start at 1. `--val-start` applies to pretrain and
+`--dora-val-start` to DoRA; `--val-epoch` is the shared validation interval.
 
 
 ## Test

@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-from models.swin_c_multibatch import swin_t_trans
+from models.swin_c_multibatch import swin_t_trans_from_state_dict
 from glob import glob
 from torchvision import transforms
 from PIL import Image
@@ -49,9 +49,11 @@ if __name__ == '__main__':
 
 
     device = torch.device('cuda')
-    model = swin_t_trans(pretrained=False)
+    checkpoint = torch.load(args.model_path, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    model = swin_t_trans_from_state_dict(state_dict)
     model.to(device)
-    model.load_state_dict(torch.load(args.model_path, device))
+    model.eval()
     epoch_minus = []
     num = 0
 

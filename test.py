@@ -2,7 +2,7 @@ import torch
 import os
 import numpy as np
 from datasets.crowd import Crowd
-from models.swin_c_multibatch import swin_t_trans
+from models.swin_c_multibatch import swin_t_trans_from_state_dict
 import argparse
 import math
 
@@ -29,12 +29,11 @@ if __name__ == '__main__':
                                              num_workers=8, pin_memory=False)
 
     device = torch.device('cuda')
-    # The checkpoint contains the trained backbone, so no download is needed.
-    model = swin_t_trans(pretrained=False)
+    checkpoint = torch.load(args.save_dir, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    model = swin_t_trans_from_state_dict(state_dict)
     model.to(device)
     model.eval()
-
-    model.load_state_dict(torch.load(args.save_dir, device))
     epoch_minus = []
     for inputs, count, name in dataloader:
         inputs = inputs.to(device)

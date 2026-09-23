@@ -1,4 +1,4 @@
-"""Compare baseline and LoRA checkpoints on clean, hazy, and mix data."""
+"""Compare baseline and DoRA checkpoints on clean, hazy, and mix data."""
 
 import argparse
 import csv
@@ -17,13 +17,13 @@ from models import swin_c_multibatch as models
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Evaluate baseline and LoRA checkpoints on three domains')
+        description='Evaluate baseline and DoRA checkpoints on three domains')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans')
     parser.add_argument('--baseline-checkpoint', default='model/swin_t_trans/baseline/0922-200006/best_model.pth',
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--lora-checkpoint', default='model/swin_t_trans/lora/0923-103544/best_model.pth',
-                        help='LoRA checkpoint; defaults to the latest best_model*.pth')
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/0923-103544/best_model.pth',
+                        help='DoRA checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')
     parser.add_argument('--data-root', default='SHA',
@@ -36,10 +36,10 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--crop-size', type=int, default=384)
     parser.add_argument('--downsample-ratio', type=int, default=16)
-    parser.add_argument('--lora-rank', type=int, default=4,
-                        help='required when the LoRA checkpoint is a .pth file')
-    parser.add_argument('--lora-alpha', type=float, default=4.0,
-                        help='must match training for a LoRA .pth checkpoint')
+    parser.add_argument('--dora-rank', type=int, default=4,
+                        help='required when the DoRA checkpoint is a .pth file')
+    parser.add_argument('--dora-alpha', type=float, default=4.0,
+                        help='must match training for a DoRA .pth checkpoint')
     return parser.parse_args()
 
 
@@ -66,35 +66,51 @@ def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
     return max(candidates, key=os.path.getmtime)
 
 
-def build_model(args, checkpoint_path, expect_lora):
+def build_model(args, checkpoint_path, expect_dora):
     checkpoint = load_checkpoint(checkpoint_path)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
                 '{} model name does not match --model-name'.format(checkpoint_path))
+        expected_stage = 'dora' if expect_dora else 'baseline'
+        if checkpoint.get('stage', expected_stage) != expected_stage:
+            raise ValueError(
+                '{} checkpoint stage does not match {}'.format(
+                    checkpoint_path, expected_stage))
+        if expect_dora and checkpoint.get('adapter_type', 'dora') != 'dora':
+            raise ValueError('{} is not a DoRA checkpoint'.format(checkpoint_path))
         state = checkpoint['model_state_dict']
-        rank = checkpoint.get('lora_rank', 0)
-        alpha = checkpoint.get('lora_alpha', args.lora_alpha)
+        rank = checkpoint.get('dora_rank', 0)
+        alpha = checkpoint.get('dora_alpha', args.dora_alpha)
     else:
         state = checkpoint
-        rank = args.lora_rank if expect_lora else 0
-        alpha = args.lora_alpha
+        rank = args.dora_rank if expect_dora else 0
+        alpha = args.dora_alpha
 
-    contains_lora = any('.parametrizations.weight.' in key for key in state)
-    if expect_lora:
-        if not contains_lora:
-            raise ValueError('{} does not contain LoRA weights'.format(checkpoint_path))
+    dora_markers = (
+        'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
+        'magnitude_q', 'magnitude_v',
+    )
+    contains_parametrization = any(
+        '.parametrizations.weight.' in key for key in state)
+    contains_dora = all(
+        any(marker in key for key in state) for marker in dora_markers)
+    if expect_dora:
+        if not contains_dora:
+            raise ValueError(
+                '{} does not contain a complete DoRA adapter'.format(
+                    checkpoint_path))
         if not rank:
             raise ValueError(
-                'LoRA .pth checkpoint needs --lora-rank and --lora-alpha')
-    elif contains_lora or rank:
+                'DoRA .pth checkpoint needs --dora-rank and --dora-alpha')
+    elif contains_parametrization or rank:
         raise ValueError(
-            '{} is a LoRA checkpoint, not a baseline checkpoint'.format(
+            '{} contains an adapter and is not a baseline checkpoint'.format(
                 checkpoint_path))
 
     model = getattr(models, args.model_name)(pretrained=False)
-    if expect_lora:
-        model.enable_lora(rank, alpha)
+    if expect_dora:
+        model.enable_dora(rank, alpha)
     model.load_state_dict(state)
     return model
 
@@ -177,18 +193,18 @@ def main():
     baseline_checkpoint = resolve_checkpoint(
         args.baseline_checkpoint, args.checkpoint_root,
         args.model_name, 'baseline')
-    lora_checkpoint = resolve_checkpoint(
-        args.lora_checkpoint, args.checkpoint_root,
-        args.model_name, 'lora')
+    dora_checkpoint = resolve_checkpoint(
+        args.dora_checkpoint, args.checkpoint_root,
+        args.model_name, 'dora')
     print('Baseline checkpoint: {}'.format(baseline_checkpoint))
-    print('LoRA checkpoint: {}'.format(lora_checkpoint))
+    print('DoRA checkpoint: {}'.format(dora_checkpoint))
 
     checkpoints = (
         ('baseline', baseline_checkpoint, False),
-        ('lora', lora_checkpoint, True),
+        ('dora', dora_checkpoint, True),
     )
-    for model_label, checkpoint_path, expect_lora in checkpoints:
-        model = build_model(args, checkpoint_path, expect_lora)
+    for model_label, checkpoint_path, expect_dora in checkpoints:
+        model = build_model(args, checkpoint_path, expect_dora)
         model.to(device).eval()
         for domain in args.domains:
             data_dir = os.path.join(args.data_root, domain, args.split)

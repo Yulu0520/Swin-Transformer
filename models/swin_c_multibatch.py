@@ -10,7 +10,7 @@ from .transformer_cosine_multibatch import (
     TransformerEncoder,
     TransformerEncoderLayer,
 )
-from .swin_lora import add_swin_qv_lora
+from .swin_dora import add_swin_qv_dora
 
 
 __all__ = ["swin_t_trans", "swin_l_trans"]
@@ -134,11 +134,11 @@ class SwinTransMultiBatch(nn.Module):
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 
-    def enable_lora(self, rank=4, alpha=4.0):
+    def enable_dora(self, rank=4, alpha=4.0):
         """Freeze the clean baseline and adapt all backbone attention Q/V."""
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        return add_swin_qv_lora(self.backbone_features, rank, alpha)
+        return add_swin_qv_dora(self.backbone_features, rank, alpha)
 
 
 def swin_t_trans(pretrained=True, pretrained_path=None):

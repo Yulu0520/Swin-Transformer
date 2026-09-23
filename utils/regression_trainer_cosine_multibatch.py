@@ -64,9 +64,9 @@ class RegTrainer(Trainer):
                 'train': os.path.join(args.data_dir, 'train'),
                 'val': os.path.join(args.data_dir, 'val'),
             },
-            'lora': {
-                'train': args.lora_train_dir,
-                'val': args.lora_val_dir,
+            'dora': {
+                'train': args.dora_train_dir,
+                'val': args.dora_val_dir,
             },
         }
         active_roots = data_roots[args.stage]
@@ -100,18 +100,18 @@ class RegTrainer(Trainer):
                           and not args.resume)
         self.model = model_builder(pretrained=use_pretrained,
                                    pretrained_path=args.pretrained_path)
-        if args.stage == 'lora':
+        if args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'baseline') != 'baseline':
-                        raise ValueError('LoRA needs a baseline checkpoint')
+                        raise ValueError('DoRA needs a baseline checkpoint')
                     if checkpoint.get('model_name', args.model_name) != args.model_name:
                         raise ValueError('Baseline checkpoint model name does not match')
                 state = checkpoint.get('model_state_dict', checkpoint)
                 self.model.load_state_dict(state)
-            count = self.model.enable_lora(args.lora_rank, args.lora_alpha)
-            logging.info('LoRA added to %d Swin attention blocks', count)
+            count = self.model.enable_dora(args.dora_rank, args.dora_alpha)
+            logging.info('DoRA added to %d Swin attention blocks', count)
         self.model.to(self.device)
         trainable = [parameter for parameter in self.model.parameters()
                      if parameter.requires_grad]
@@ -131,11 +131,12 @@ class RegTrainer(Trainer):
                     raise ValueError('Resume checkpoint stage does not match')
                 if checkpoint.get('model_name', args.model_name) != args.model_name:
                     raise ValueError('Resume checkpoint model name does not match')
-                if args.stage == 'lora' and (
-                    checkpoint.get('lora_rank') != args.lora_rank
-                    or checkpoint.get('lora_alpha') != args.lora_alpha
+                if args.stage == 'dora' and (
+                    checkpoint.get('adapter_type', 'dora') != 'dora'
+                    or checkpoint.get('dora_rank') != args.dora_rank
+                    or checkpoint.get('dora_alpha') != args.dora_alpha
                 ):
-                    raise ValueError('Resume checkpoint LoRA settings do not match')
+                    raise ValueError('Resume checkpoint DoRA settings do not match')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 # New checkpoints store both the human-facing 1-based epoch
@@ -201,8 +202,8 @@ class RegTrainer(Trainer):
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
-        # The LoRA stage keeps the frozen baseline's dropout and stochastic
-        # depth in inference mode while gradients update LoRA parameters.
+        # The DoRA stage keeps the frozen baseline's dropout and stochastic
+        # depth in inference mode while gradients update DoRA parameters.
         self.model.train(self.args.stage == 'baseline')
 
         train_bar = tqdm(
@@ -320,8 +321,9 @@ class RegTrainer(Trainer):
             'model_name': self.args.model_name,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
-            'lora_rank': self.args.lora_rank if self.args.stage == 'lora' else 0,
-            'lora_alpha': self.args.lora_alpha if self.args.stage == 'lora' else 0,
+            'adapter_type': 'dora' if self.args.stage == 'dora' else None,
+            'dora_rank': self.args.dora_rank if self.args.stage == 'dora' else 0,
+            'dora_alpha': self.args.dora_alpha if self.args.stage == 'dora' else 0,
             'seed': self.args.seed,
             'best_mae': self.best_mae,
             'best_mse': self.best_mse,

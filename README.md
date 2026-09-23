@@ -16,14 +16,19 @@ The CCST count head and CCST trainer are not used.
 Install dependencies with `pip install -r requirements.txt`. By default,
 `python train.py` first trains the full 24-block baseline on `SHA/clean/train`
 and selects its best checkpoint on `SHA/clean/val`. It then freezes that
-baseline and trains Q/V LoRA in all 24 Swin attention blocks on
+baseline and trains Q/V DoRA in all 24 Swin attention blocks on
 `SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
-and custom Transformer stay frozen during LoRA training.
+and custom Transformer stay frozen during DoRA training.
+
+DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
+for every Q/V output vector. K remains unchanged. The magnitude is initialized
+from the clean baseline, so attaching DoRA does not change the model output
+before adaptation starts.
 
 ```bash
 python train.py
 python train.py --stage baseline
-python train.py --stage lora \
+python train.py --stage dora \
   --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth
 ```
 
@@ -35,10 +40,10 @@ for 256×256 crops. `--no-pretrained-backbone` starts from random weights.
 The optional `--model-name swin_t_trans` retains the earlier 12-block Swin-T
 model; the default `swin_l_trans` has 24 blocks.
 
-Clean/hazy/mix paths can be changed with `--data-dir`, `--lora-train-dir`, and
-`--lora-val-dir`. Each split contains `.jpg` images and matching `.npy` point
+Clean/hazy/mix paths can be changed with `--data-dir`, `--dora-train-dir`, and
+`--dora-val-dir`. Each split contains `.jpg` images and matching `.npy` point
 annotations. `--resume <epoch_ckpt.tar>` continues the selected stage; with
-the default `--stage both`, it resumes the baseline before LoRA starts.
+the default `--stage both`, it resumes the baseline before DoRA starts.
 
 Training and validation progress are displayed with tqdm. TensorBoard scalar
 logs are stored under `model/<model-name>/<stage>/<run>/tensorboard/` and can be viewed with:
@@ -53,25 +58,25 @@ are 1-based. The two stages have separate schedules:
 | Stage | Epochs | Validate every | First validation index |
 | --- | ---: | ---: | ---: |
 | Clean baseline | `--pretrain-epochs 500` | `--pretrain-val-epoch 5` | `--pretrain-val-start 100` |
-| Hazy/mix LoRA | `--lora-epochs 1200` | `--lora-val-epoch 5` | `--lora-val-start 500` |
+| Hazy/mix DoRA | `--dora-epochs 1200` | `--dora-val-epoch 5` | `--dora-val-start 500` |
 
 The validation starts are **zero-based**. With these defaults, baseline first
-validates after epoch 101 and LoRA first validates after epoch 501. `--max-epoch`,
-`--val-epoch`, and `--val-start` are aliases for the three LoRA options.
+validates after epoch 101 and DoRA first validates after epoch 501. `--max-epoch`,
+`--val-epoch`, and `--val-start` are aliases for the three DoRA options.
 
 
 ## Test
 
 ```bash
-python test.py --data-dir SHA/clean --split val \
-  --save-dir model/swin_l_trans/baseline/RUN/best_model.pth
-python test.py --data-dir SHA/mix --split val \
-  --save-dir model/swin_l_trans/lora/RUN/best_model.pth --lora-rank 4 --lora-alpha 4
+python test.py --data-root SHA --split val \
+  --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth \
+  --dora-checkpoint model/swin_l_trans/dora/RUN/best_model.pth \
+  --dora-rank 4 --dora-alpha 4
 ```
 
-Epoch `.tar` checkpoints contain stage, model name, optimizer, and LoRA
-settings. Best `.pth` checkpoints contain model weights; supply the LoRA rank
-and alpha when evaluating a LoRA `.pth` checkpoint.
+Epoch `.tar` checkpoints contain stage, model name, optimizer, and DoRA
+settings. Best `.pth` checkpoints contain model weights; supply the DoRA rank
+and alpha when evaluating a DoRA `.pth` checkpoint.
 
 
 ## Citation

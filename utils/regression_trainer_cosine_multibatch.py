@@ -264,7 +264,6 @@ class RegTrainer(Trainer):
             'val': Crowd(
                 os.path.join(mix_data_dir, 'val'), args.crop_size,
                 args.downsample_ratio, args.is_gray, 'val',
-                name_prefix='night_',
             ),
         }
         for split, dataset in datasets.items():
@@ -560,6 +559,9 @@ class RegTrainer(Trainer):
             ),
             'counting_scope': (
                 'all_mix_images_independent' if self.phase == 'dora' else 'day'
+            ),
+            'validation_scope': (
+                'all_mix_images' if self.phase == 'dora' else 'day'
             ),
             'loss_definition': (
                 'mix_bayesian_plus_pair' if self.phase == 'dora'

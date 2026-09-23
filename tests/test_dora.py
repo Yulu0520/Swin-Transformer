@@ -214,7 +214,7 @@ class SwinDoRATests(unittest.TestCase):
             )
             self.assertEqual(len(trainer.datasets['train']), 2)
             self.assertEqual(len(trainer.datasets['pair']), 1)
-            self.assertEqual(len(trainer.datasets['val']), 1)
+            self.assertEqual(len(trainer.datasets['val']), 2)
             self.assertEqual(trainer.dataloaders['train'].batch_size, 2)
             self.assertEqual(trainer.dataloaders['pair'].batch_size, 1)
             self.assertEqual(trainer.dataloaders['val'].batch_size, 1)
@@ -282,6 +282,7 @@ class SwinDoRATests(unittest.TestCase):
             self.assertEqual(
                 checkpoint['counting_scope'], 'all_mix_images_independent'
             )
+            self.assertEqual(checkpoint['validation_scope'], 'all_mix_images')
             self.assertEqual(
                 checkpoint['loss_definition'], 'mix_bayesian_plus_pair'
             )

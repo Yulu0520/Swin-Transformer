@@ -19,7 +19,7 @@ def parse_args():
 
     parser.add_argument('--resume', default='',
                         help='the path of resume training model')
-    parser.add_argument('--init-checkpoint', default=r'',
+    parser.add_argument('--init-checkpoint', default=r'/home/mmslab-1080/Desktop/Swin Transformer/Boosting-Crowd-Counting-via-Multifaceted-Attention-main/model/0923-125749/pretrain_best_model.pth',
                         help='initialize from a trained Swin-MAN model without DoRA')
 
     parser.add_argument('--data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',

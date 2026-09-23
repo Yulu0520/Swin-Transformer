@@ -21,8 +21,9 @@ Separately, `mix/train/IMG_n.jpg` is paired with
 identical geometric augmentation and do not use annotations in this stream. A
 frozen, eval-mode copy of the best pretrain model extracts the day stage-4
 feature, while the DoRA backbone extracts the night feature. The DoRA loss is
-`Bayesian_mix + pair_loss_weight * paired_cosine`. Validation uses only
-`mix/val/night_*.jpg`. Files named `._*.jpg` are ignored.
+`Bayesian_mix + pair_loss_weight * paired_cosine`. Validation uses every
+image in `mix/val/`, and the best DoRA checkpoint is selected from the mixed
+day/night MAE and RMSE. Files named `._*.jpg` are ignored.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -43,7 +44,7 @@ checkpoints are not compatible with the Swin-T model.
 `--max-epoch` controls pretrain, and `--dora-epochs` controls DoRA-only
 training. `--data-dir` supplies day `train/` and `val/` folders;
 `--dora-data-dir` supplies independent counting images and paired day/night
-images from `mix/train/`, plus night-only validation from `mix/val/`. The
+images from `mix/train/`, plus all mixed validation images from `mix/val/`. The
 current `train.py` defaults point to the local SHA `day` and `mix` datasets;
 pass both paths explicitly for another setup. `--batch-size` controls the mix
 counting stream and `--pair-batch-size` controls the paired feature stream.

@@ -180,25 +180,25 @@ class SwinDoRATests(unittest.TestCase):
 
     def test_dora_dataloaders_use_separate_train_and_val_folders(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            dora_dir = os.path.join(tmpdir, 'night')
-            day_train = os.path.join(tmpdir, 'day', 'train')
-            os.makedirs(day_train)
+            dora_dir = os.path.join(tmpdir, 'mix')
             for split in ('train', 'val'):
                 split_dir = os.path.join(dora_dir, split)
                 os.makedirs(split_dir)
                 Image.new('RGB', (16, 16)).save(
                     os.path.join(split_dir, 'night_IMG_1.jpg')
                 )
-            Image.new('RGB', (16, 16)).save(
-                os.path.join(day_train, 'IMG_1.jpg')
-            )
+                Image.new('RGB', (16, 16)).save(
+                    os.path.join(split_dir, 'IMG_1.jpg')
+                )
+            np.save(os.path.join(dora_dir, 'train', 'IMG_1.npy'),
+                    np.empty((0, 3)))
             np.save(os.path.join(dora_dir, 'train', 'night_IMG_1.npy'),
                     np.empty((0, 3)))
             trainer = RegTrainer.__new__(RegTrainer)
             trainer.args = SimpleNamespace(
                 data_dir=os.path.join(tmpdir, 'day'), dora_data_dir=dora_dir,
                 crop_size=256, downsample_ratio=16, is_gray=False,
-                batch_size=2, num_workers=0,
+                batch_size=2, pair_batch_size=1, num_workers=0,
             )
             trainer.device_count = 1
             trainer.phase = 'dora'
@@ -207,9 +207,16 @@ class SwinDoRATests(unittest.TestCase):
                 trainer.datasets['train'].root_path, os.path.join(dora_dir, 'train')
             )
             self.assertEqual(
+                trainer.datasets['pair'].root_path, os.path.join(dora_dir, 'train')
+            )
+            self.assertEqual(
                 trainer.datasets['val'].root_path, os.path.join(dora_dir, 'val')
             )
+            self.assertEqual(len(trainer.datasets['train']), 2)
+            self.assertEqual(len(trainer.datasets['pair']), 1)
+            self.assertEqual(len(trainer.datasets['val']), 1)
             self.assertEqual(trainer.dataloaders['train'].batch_size, 2)
+            self.assertEqual(trainer.dataloaders['pair'].batch_size, 1)
             self.assertEqual(trainer.dataloaders['val'].batch_size, 1)
 
     def test_paired_images_share_geometry_and_ignore_appledouble(self):
@@ -222,25 +229,33 @@ class SwinDoRATests(unittest.TestCase):
             image = Image.fromarray(np.stack([pixels] * 3, axis=-1))
             image.save(os.path.join(day_dir, 'IMG_1.jpg'))
             image.save(os.path.join(night_dir, 'night_IMG_1.jpg'))
-            np.save(os.path.join(night_dir, 'night_IMG_1.npy'),
-                    np.array([[64., 64., 16.]]))
             with open(os.path.join(day_dir, '._IMG_1.jpg'), 'wb') as file:
                 file.write(b'not an image')
             self.assertEqual(len(Crowd(day_dir, 64, 16)), 1)
 
             dataset = PairedCrowd(day_dir, night_dir, 64, 16)
-            day, night, points, targets, _ = dataset[0]
+            day, night = dataset[0]
             self.assertTrue(torch.equal(day, night))
             self.assertEqual(tuple(day.shape), (3, 64, 64))
-            self.assertEqual(points.shape[-1], 2)
-            self.assertEqual(points.shape[0], targets.shape[0])
+
+    def test_paired_images_do_not_require_annotations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Image.new('RGB', (64, 64)).save(os.path.join(tmpdir, 'IMG_1.jpg'))
+            Image.new('RGB', (64, 64)).save(
+                os.path.join(tmpdir, 'night_IMG_1.jpg')
+            )
+            dataset = PairedCrowd(tmpdir, tmpdir, 64, 16)
+            day, night = dataset[0]
+            self.assertEqual(tuple(day.shape), (3, 64, 64))
+            self.assertEqual(tuple(night.shape), (3, 64, 64))
 
     def test_dora_checkpoint_stores_teacher_and_pair_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             trainer = RegTrainer.__new__(RegTrainer)
             trainer.args = SimpleNamespace(
                 model_name='swin_t_trans', pair_loss_weight=1.0,
-                data_dir='/data/day', dora_data_dir='/data/night',
+                pair_batch_size=2, data_dir='/data/day',
+                dora_data_dir='/data/mix',
             )
             trainer.save_dir = tmpdir
             trainer.phase = 'dora'
@@ -263,8 +278,17 @@ class SwinDoRATests(unittest.TestCase):
             )
             self.assertEqual(checkpoint['best_mae'], 3.0)
             self.assertEqual(checkpoint['pair_loss_weight'], 1.0)
+            self.assertEqual(checkpoint['pair_batch_size'], 2)
+            self.assertEqual(
+                checkpoint['counting_scope'], 'all_mix_images_independent'
+            )
+            self.assertEqual(
+                checkpoint['loss_definition'], 'mix_bayesian_plus_pair'
+            )
+            self.assertEqual(checkpoint['bayesian_data_dir'], '/data/mix')
             self.assertIn('weight', checkpoint['teacher_state_dict'])
-            self.assertEqual(checkpoint['paired_night_data_dir'], '/data/night')
+            self.assertEqual(checkpoint['paired_day_data_dir'], '/data/mix')
+            self.assertEqual(checkpoint['paired_night_data_dir'], '/data/mix')
 
 
 if __name__ == '__main__':

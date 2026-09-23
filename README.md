@@ -14,13 +14,15 @@ inserted into the `qkv` and output `proj` Linear layers of all 12 Swin-T
 attention blocks (24 DoRA modules). During the DoRA stage, every other model
 parameter is frozen. No MoE module is used.
 
-DoRA training pairs `day/train/IMG_n.jpg` with
-`night/train/night_IMG_n.jpg` and uses `night_IMG_n.npy` for counting.
-Both images receive identical geometric augmentation. A frozen, eval-mode
-copy of the best pretrain model extracts the day stage-4 feature; the DoRA
-model extracts the night feature and predicts the night density map. The DoRA
-loss is `Bayesian_night + pair_loss_weight * paired_cosine`. Validation uses
-night images only. Files named `._*.jpg` are ignored.
+DoRA uses two independent training streams. Every image in `mix/train/` is an
+independent counting sample with its own `.npy` annotation for Bayesian loss.
+Separately, `mix/train/IMG_n.jpg` is paired with
+`mix/train/night_IMG_n.jpg` for cosine feature alignment; paired images receive
+identical geometric augmentation and do not use annotations in this stream. A
+frozen, eval-mode copy of the best pretrain model extracts the day stage-4
+feature, while the DoRA backbone extracts the night feature. The DoRA loss is
+`Bayesian_mix + pair_loss_weight * paired_cosine`. Validation uses only
+`mix/val/night_*.jpg`. Files named `._*.jpg` are ignored.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -30,7 +32,7 @@ night images only. Files named `._*.jpg` are ignored.
 1. Install dependencies with `pip install -r requirements.txt`.
 2. Dowload Dataset JHU++ or UCF-QNRF.
 3. Preprocess them with `preprocess_dataset_jhu.py` or `preprocess_dataset_ucf.py`.
-4. Run `python train.py --data-dir <day-root> --dora-data-dir <night-root> --batch-size 2 --max-epoch 10 --dora-epochs 10 --pair-loss-weight 1.0`.
+4. Run `python train.py --data-dir <day-root> --dora-data-dir <mix-root> --batch-size 4 --pair-batch-size 2 --max-epoch 10 --dora-epochs 10 --pair-loss-weight 1.0`.
 5. Wait patiently for the program to finish.
 6. Then you will get a good counting model!
 
@@ -40,9 +42,12 @@ checkpoints are not compatible with the Swin-T model.
 
 `--max-epoch` controls pretrain, and `--dora-epochs` controls DoRA-only
 training. `--data-dir` supplies day `train/` and `val/` folders;
-`--dora-data-dir` supplies the paired night `train/` and night-only `val/`
-folders. The current `train.py` defaults point to the local SHA `day` and
-`night` datasets; pass both paths explicitly for another setup. DoRA's
+`--dora-data-dir` supplies independent counting images and paired day/night
+images from `mix/train/`, plus night-only validation from `mix/val/`. The
+current `train.py` defaults point to the local SHA `day` and `mix` datasets;
+pass both paths explicitly for another setup. `--batch-size` controls the mix
+counting stream and `--pair-batch-size` controls the paired feature stream.
+With 600 mix images, 300 pairs, and defaults 4/2, both have 150 batches. DoRA's
 `--pair-loss-weight` defaults to 1.0 and should be tuned using the separate
 Bayesian and pair-loss metrics. DoRA rank and alpha default to 8; change them
 with `--dora-rank` and `--dora-alpha`. Use `--no-dora` for pretrain only. To
@@ -63,7 +68,8 @@ tensorboard --logdir model
 ```
 
 TensorBoard metrics are grouped under `pretrain/` and `dora/`. DoRA records
-Bayesian, pair, and total loss along with counting metrics. Epoch numbers in
+the independent mix Bayesian loss, paired cosine loss, total loss, and mix
+counting metrics. Epoch numbers in
 each stage start at 1. `--val-start` applies to pretrain and
 `--dora-val-start` to DoRA; `--val-epoch` is the shared validation interval.
 

@@ -14,12 +14,12 @@ def parse_args():
                         help='whether to save all best model')
     parser.add_argument('--lr', type=float, default=5*1e-6,
                         help='the initial learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-5,
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='the weight decay')
 
     parser.add_argument('--resume', default='',
                         help='the path of resume training model')
-    parser.add_argument('--init-checkpoint', default='',
+    parser.add_argument('--init-checkpoint', default=r'',
                         help='initialize from a trained Swin-MAN model without DoRA')
 
     parser.add_argument('--data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
@@ -40,17 +40,19 @@ def parse_args():
                         help='rank of each Swin attention DoRA layer')
     parser.add_argument('--dora-alpha', type=float, default=8.0,
                         help='scaling numerator for each DoRA layer')
-    parser.add_argument('--dora-data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/night',
-                        help='DoRA data directory (with train/ and val/)')
+    parser.add_argument('--dora-data-dir', default=r'/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix',
+                        help='mix directory for independent counting and paired features')
     parser.add_argument('--pair-loss-weight', type=float, default=1.0,
                         help='weight of day/night paired cosine loss in DoRA training')
     parser.add_argument('--dora-epochs', type=int, default=10,
                         help='number of DoRA-only epochs after pretrain')
     parser.add_argument('--dora-val-start', type=int, default=5,
-                        help='first DoRA epoch eligible for validation; defaults to --val-start')
+                        help='first DoRA epoch eligible for validation (default: 5)')
 
     parser.add_argument('--batch-size', type=int, default=4,
-                        help='train batch size')
+                        help='counting-image train batch size')
+    parser.add_argument('--pair-batch-size', type=int, default=2,
+                        help='day/night pair batch size for DoRA cosine loss')
     parser.add_argument('--device', default='0', help='assign device')
     parser.add_argument('--num-workers', type=int, default=8,
                         help='the num of training process')
@@ -63,7 +65,7 @@ def parse_args():
 
     parser.add_argument('--is-gray', type=bool, default=False,
                         help='whether the input image is gray')
-    parser.add_argument('--crop-size', type=int, default=256,
+    parser.add_argument('--crop-size', type=int, default=384,
                         help='the crop size of the train image')
     parser.add_argument('--downsample-ratio', type=int, default=16,
                         help='downsample ratio')

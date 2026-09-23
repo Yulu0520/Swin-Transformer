@@ -30,12 +30,14 @@ def cal_innner_area(c_left, c_up, c_right, c_down, bbox):
 class Crowd(data.Dataset):
     def __init__(self, root_path, crop_size,
                  downsample_ratio, is_gray=False,
-                 method='train'):
+                 method='train', name_prefix=None):
 
         self.root_path = root_path
         self.im_list = sorted(
             path for path in glob(os.path.join(self.root_path, '*.jpg'))
-            if not os.path.basename(path).startswith('._')
+            if (not os.path.basename(path).startswith('._')
+                and (name_prefix is None
+                     or os.path.basename(path).startswith(name_prefix)))
         )
         if method not in ['train', 'val']:
             raise Exception("not implement")
@@ -121,58 +123,57 @@ class Crowd(data.Dataset):
 
 
 class PairedCrowd(Crowd):
-    """Aligned day/night crops with counting targets from the night image."""
+    """Aligned day/night crops used only for feature matching."""
 
     def __init__(self, day_root, night_root, crop_size, downsample_ratio,
                  is_gray=False):
-        super().__init__(night_root, crop_size, downsample_ratio, is_gray, 'train')
+        super().__init__(night_root, crop_size, downsample_ratio, is_gray,
+                         'train', name_prefix='night_')
         self.day_root = day_root
         self.pairs = []
+        expected_day_names = set()
         for night_path in self.im_list:
             night_name = os.path.basename(night_path)
-            if not night_name.startswith('night_'):
-                raise ValueError('expected night_ filename: {}'.format(night_path))
             day_path = os.path.join(day_root, night_name.removeprefix('night_'))
-            label_path = os.path.splitext(night_path)[0] + '.npy'
-            if not os.path.isfile(day_path) or not os.path.isfile(label_path):
+            if not os.path.isfile(day_path):
                 raise FileNotFoundError(
-                    'missing day image or night annotation for {}'.format(night_path)
+                    'missing paired day image for {}'.format(night_path)
                 )
             with Image.open(day_path) as day, Image.open(night_path) as night:
                 if day.size != night.size:
                     raise ValueError(
                         'unaligned pair sizes: {} {}'.format(day_path, night_path)
                     )
-            self.pairs.append((day_path, night_path, label_path))
+            expected_day_names.add(os.path.basename(day_path))
+            self.pairs.append((day_path, night_path))
+        available_day_names = {
+            os.path.basename(path)
+            for path in glob(os.path.join(day_root, 'IMG_*.jpg'))
+            if not os.path.basename(path).startswith('._')
+        }
+        if available_day_names != expected_day_names:
+            raise ValueError('unpaired day images found in {}'.format(day_root))
 
     def __getitem__(self, item):
-        day_path, night_path, label_path = self.pairs[item]
+        day_path, night_path = self.pairs[item]
         with Image.open(day_path) as image:
             day = image.convert('RGB')
         with Image.open(night_path) as image:
             night = image.convert('RGB')
         if day.size != night.size:
             raise ValueError('unaligned pair sizes: {} {}'.format(day_path, night_path))
-        keypoints = np.load(label_path).copy()
-        return self.paired_train_transform(day, night, keypoints)
+        return self.paired_train_transform(day, night)
 
-    def paired_train_transform(self, day, night, keypoints):
+    def paired_train_transform(self, day, night):
         width, height = day.size
         resize_scale = random.random() * 0.5 + 0.75
         resized_width = int(width * resize_scale)
         resized_height = int(height * resize_scale)
         if min(resized_width, resized_height) >= self.c_size:
-            original_width, original_height = width, height
             width, height = resized_width, resized_height
             day = day.resize((width, height))
             night = night.resize((width, height))
-            keypoints[:, 0] *= width / original_width
-            keypoints[:, 1] *= height / original_height
-            keypoints[:, 2] *= (
-                (width / original_width) * (height / original_height)
-            ) ** 0.5
-        st_size = min(width, height)
-        if st_size < self.c_size:
+        if min(width, height) < self.c_size:
             raise ValueError('paired image is smaller than crop size')
 
         top, left, crop_h, crop_w = random_crop(
@@ -180,28 +181,8 @@ class PairedCrowd(Crowd):
         )
         day = F.crop(day, top, left, crop_h, crop_w)
         night = F.crop(night, top, left, crop_h, crop_w)
-        if len(keypoints) > 0:
-            nearest_dis = np.clip(keypoints[:, 2], 4.0, 128.0)
-            points_left_up = keypoints[:, :2] - nearest_dis[:, None] / 2.0
-            points_right_down = keypoints[:, :2] + nearest_dis[:, None] / 2.0
-            bbox = np.concatenate((points_left_up, points_right_down), axis=1)
-            inner_area = cal_innner_area(
-                left, top, left + crop_w, top + crop_h, bbox
-            )
-            ratio = np.clip(inner_area / (nearest_dis * nearest_dis), 0.0, 1.0)
-            mask = ratio >= 0.3
-            targets = ratio[mask]
-            keypoints = keypoints[mask, :2] - [left, top]
-        else:
-            targets = np.array([])
-            keypoints = keypoints[:, :2]
-        if random.random() > 0.5:
+        flip = random.random() > 0.5
+        if flip:
             day = F.hflip(day)
             night = F.hflip(night)
-            if len(keypoints) > 0:
-                keypoints[:, 0] = crop_w - keypoints[:, 0]
-        return (
-            self.trans(day), self.trans(night),
-            torch.from_numpy(keypoints.copy()).float(),
-            torch.from_numpy(targets.copy()).float(), st_size,
-        )
+        return self.trans(day), self.trans(night)

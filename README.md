@@ -23,13 +23,37 @@ and custom Transformer stay frozen during DoRA training.
 DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
 for every Q/V output vector. K remains unchanged. The magnitude is initialized
 from the clean baseline, so attaching DoRA does not change the model output
-before adaptation starts.
+before adaptation starts. The parallel LoRA branch is present but frozen during
+this stage and is never called by the DoRA forward route.
+
+The optional third stage adds a LoRA branch in parallel with the trained DoRA
+branch. Both branches read the same frozen baseline Q/V weight, and exactly one
+branch is evaluated per forward: `DoRA(W_base)` or `W_base + LoRA_delta`. During
+LoRA training, the baseline and complete DoRA branch are frozen and DoRA is not
+called; only LoRA A/B matrices are optimized. LoRA B starts at zero, so its
+initial route exactly preserves the clean baseline weight. K, the MAN encoder,
+and the density head are shared and frozen. `--lora-train-dir` and
+`--lora-val-dir` have no default paths and must be supplied for `--stage lora`
+or `--stage all`.
 
 ```bash
 python train.py
 python train.py --stage baseline
 python train.py --stage dora \
   --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth
+
+# Third stage: freeze baseline + DoRA and train only LoRA Q/V matrices.
+python train.py --stage lora \
+  --dora-checkpoint model/swin_t_trans/dora/RUN/best_model.pth \
+  --lora-train-dir /path/to/lora/train \
+  --lora-val-dir /path/to/lora/val \
+  --dora-rank 4 --dora-alpha 4 \
+  --lora-rank 4 --lora-alpha 4
+
+# Run all three stages in sequence. LoRA paths are intentionally explicit.
+python train.py --stage all \
+  --lora-train-dir /path/to/lora/train \
+  --lora-val-dir /path/to/lora/val
 ```
 
 The default training crop is **256×256**. The official ImageNet-22K
@@ -71,12 +95,16 @@ validates after epoch 101 and DoRA first validates after epoch 501. `--max-epoch
 python test.py --data-root SHA --split val \
   --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth \
   --dora-checkpoint model/swin_l_trans/dora/RUN/best_model.pth \
-  --dora-rank 4 --dora-alpha 4
+  --lora-checkpoint model/swin_l_trans/lora/RUN/best_model.pth \
+  --dora-rank 4 --dora-alpha 4 \
+  --lora-rank 4 --lora-alpha 4 \
+  --hybrid-route lora
 ```
 
-Epoch `.tar` checkpoints contain stage, model name, optimizer, and DoRA
-settings. Best `.pth` checkpoints contain model weights; supply the DoRA rank
-and alpha when evaluating a DoRA `.pth` checkpoint.
+Epoch `.tar` checkpoints contain stage, model name, optimizer, and both adapter
+settings. Best `.pth` checkpoints contain model weights; supply the DoRA and
+LoRA rank/alpha values when loading a parallel `.pth` checkpoint. The active
+route is selected at runtime and is not stored as a learned parameter.
 
 
 ## Citation

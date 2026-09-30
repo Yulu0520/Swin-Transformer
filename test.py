@@ -1,4 +1,4 @@
-"""Compare baseline and DoRA checkpoints on clean, hazy, and mix data."""
+"""Compare baseline, DoRA, and optional parallel-adapter checkpoints."""
 
 import argparse
 import csv
@@ -17,13 +17,17 @@ from models import swin_c_multibatch as models
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Evaluate baseline and DoRA checkpoints on three domains')
+        description='Evaluate baseline, DoRA, and hybrid checkpoints')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans')
     parser.add_argument('--baseline-checkpoint', default='model/swin_t_trans/baseline/0922-200006/best_model.pth',
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/0923-103544/best_model.pth',
                         help='DoRA checkpoint; defaults to the latest best_model*.pth')
+    parser.add_argument('--lora-checkpoint', default='',
+                        help='optional parallel DoRA/LoRA checkpoint')
+    parser.add_argument('--hybrid-route', choices=['dora', 'lora'], default='lora',
+                        help='active branch when evaluating the hybrid checkpoint')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')
     parser.add_argument('--data-root', default='SHA',
@@ -40,6 +44,10 @@ def parse_args():
                         help='required when the DoRA checkpoint is a .pth file')
     parser.add_argument('--dora-alpha', type=float, default=4.0,
                         help='must match training for a DoRA .pth checkpoint')
+    parser.add_argument('--lora-rank', type=int, default=4,
+                        help='required when the hybrid checkpoint is a .pth file')
+    parser.add_argument('--lora-alpha', type=float, default=4.0,
+                        help='must match training for a hybrid .pth checkpoint')
     return parser.parse_args()
 
 
@@ -77,15 +85,19 @@ def build_model(args, checkpoint_path, expect_dora):
             raise ValueError(
                 '{} checkpoint stage does not match {}'.format(
                     checkpoint_path, expected_stage))
-        if expect_dora and checkpoint.get('adapter_type', 'dora') != 'dora':
+        if (expect_dora and checkpoint.get('adapter_type', 'dora') not in
+                ('dora', 'parallel_dora_lora')):
             raise ValueError('{} is not a DoRA checkpoint'.format(checkpoint_path))
         state = checkpoint['model_state_dict']
         rank = checkpoint.get('dora_rank', 0)
         alpha = checkpoint.get('dora_alpha', args.dora_alpha)
+        lora_rank = checkpoint.get('lora_rank', args.lora_rank)
+        lora_alpha = checkpoint.get('lora_alpha', args.lora_alpha)
     else:
         state = checkpoint
         rank = args.dora_rank if expect_dora else 0
         alpha = args.dora_alpha
+        lora_rank, lora_alpha = args.lora_rank, args.lora_alpha
 
     dora_markers = (
         'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
@@ -95,6 +107,10 @@ def build_model(args, checkpoint_path, expect_dora):
         '.parametrizations.weight.' in key for key in state)
     contains_dora = all(
         any(marker in key for key in state) for marker in dora_markers)
+    contains_parallel = (
+        any('.parametrizations.weight.0.dora.' in key for key in state)
+        and any('.parametrizations.weight.0.lora.' in key for key in state)
+    )
     if expect_dora:
         if not contains_dora:
             raise ValueError(
@@ -110,8 +126,57 @@ def build_model(args, checkpoint_path, expect_dora):
 
     model = getattr(models, args.model_name)(pretrained=False)
     if expect_dora:
-        model.enable_dora(rank, alpha)
+        if contains_parallel:
+            model.enable_parallel_adapters(
+                rank, alpha, lora_rank, lora_alpha, active_route='dora')
+        else:
+            model.enable_dora(rank, alpha)
     model.load_state_dict(state)
+    if expect_dora and contains_parallel:
+        model.set_adapter_route('dora')
+    return model
+
+
+def build_hybrid_model(args, checkpoint_path):
+    checkpoint = load_checkpoint(checkpoint_path)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        if checkpoint.get('model_name', args.model_name) != args.model_name:
+            raise ValueError(
+                '{} model name does not match --model-name'.format(checkpoint_path))
+        if checkpoint.get('stage') != 'lora':
+            raise ValueError('{} is not a LoRA-stage checkpoint'.format(
+                checkpoint_path))
+        if checkpoint.get('adapter_type') != 'parallel_dora_lora':
+            raise ValueError('{} is not a DoRA+LoRA checkpoint'.format(
+                checkpoint_path))
+        state = checkpoint['model_state_dict']
+        dora_rank = checkpoint.get('dora_rank')
+        dora_alpha = checkpoint.get('dora_alpha')
+        lora_rank = checkpoint.get('lora_rank')
+        lora_alpha = checkpoint.get('lora_alpha')
+    else:
+        state = checkpoint
+        dora_rank, dora_alpha = args.dora_rank, args.dora_alpha
+        lora_rank, lora_alpha = args.lora_rank, args.lora_alpha
+
+    required_markers = (
+        'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
+        'magnitude_q', 'magnitude_v',
+        'lora_A_q', 'lora_B_q', 'lora_A_v', 'lora_B_v',
+    )
+    if not all(any(marker in key for key in state)
+               for marker in required_markers):
+        raise ValueError('{} does not contain complete DoRA+LoRA adapters'.format(
+            checkpoint_path))
+    if not all((dora_rank, dora_alpha, lora_rank, lora_alpha)):
+        raise ValueError('DoRA and LoRA rank/alpha must be positive')
+
+    model = getattr(models, args.model_name)(pretrained=False)
+    model.enable_parallel_adapters(
+        dora_rank, dora_alpha, lora_rank, lora_alpha,
+        active_route=args.hybrid_route)
+    model.load_state_dict(state)
+    model.set_adapter_route(args.hybrid_route)
     return model
 
 
@@ -199,12 +264,23 @@ def main():
     print('Baseline checkpoint: {}'.format(baseline_checkpoint))
     print('DoRA checkpoint: {}'.format(dora_checkpoint))
 
-    checkpoints = (
+    checkpoints = [
         ('baseline', baseline_checkpoint, False),
         ('dora', dora_checkpoint, True),
-    )
+    ]
+    if args.lora_checkpoint:
+        if not os.path.isfile(args.lora_checkpoint):
+            raise FileNotFoundError(
+                'Checkpoint not found: {}'.format(args.lora_checkpoint))
+        print('LoRA checkpoint: {}'.format(args.lora_checkpoint))
+        checkpoints.append(('hybrid_' + args.hybrid_route,
+                            args.lora_checkpoint, None))
+
     for model_label, checkpoint_path, expect_dora in checkpoints:
-        model = build_model(args, checkpoint_path, expect_dora)
+        if model_label.startswith('hybrid_'):
+            model = build_hybrid_model(args, checkpoint_path)
+        else:
+            model = build_model(args, checkpoint_path, expect_dora)
         model.to(device).eval()
         for domain in args.domains:
             data_dir = os.path.join(args.data_root, domain, args.split)

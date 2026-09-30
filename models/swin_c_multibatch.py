@@ -11,6 +11,11 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
+from .swin_lora import (
+    ParallelQVAdapter,
+    add_swin_qv_parallel_adapters,
+    set_swin_adapter_route,
+)
 
 
 __all__ = ["swin_t_trans", "swin_l_trans"]
@@ -139,6 +144,32 @@ class SwinTransMultiBatch(nn.Module):
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         return add_swin_qv_dora(self.backbone_features, rank, alpha)
+
+    def enable_parallel_adapters(
+            self, dora_rank=4, dora_alpha=4.0,
+            lora_rank=4, lora_alpha=4.0,
+            active_route='lora', trainable_route=None):
+        """Attach mutually exclusive DoRA/LoRA branches to backbone Q/V."""
+        count = add_swin_qv_parallel_adapters(
+            self.backbone_features,
+            dora_rank, dora_alpha, lora_rank, lora_alpha,
+            active_route=active_route,
+        )
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+        if trainable_route is not None:
+            if trainable_route != active_route or trainable_route not in ('dora', 'lora'):
+                raise ValueError('trainable route must match active DoRA/LoRA route')
+            for module in self.backbone_features.modules():
+                if isinstance(module, ParallelQVAdapter):
+                    branch = getattr(module, trainable_route)
+                    for parameter in branch.parameters():
+                        parameter.requires_grad_(True)
+        return count
+
+    def set_adapter_route(self, route):
+        """Select baseline, DoRA, or LoRA for every Swin Q/V projection."""
+        return set_swin_adapter_route(self.backbone_features, route)
 
 
 def swin_t_trans(pretrained=True, pretrained_path=None):

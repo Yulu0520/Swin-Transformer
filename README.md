@@ -101,6 +101,60 @@ python test.py --data-root SHA --split val \
   --hybrid-route lora
 ```
 
+To route every mixed-set image by its filename, use a parallel LoRA-stage
+checkpoint. Files named `IMG_*` use the baseline+LoRA branch, while files named
+`night_IMG_*` use the baseline+DoRA branch. The summary CSV contains overall
+MAE/RMSE; the routing CSV records the selected branch and count error for every
+image.
+
+```bash
+python test.py \
+  --model-name swin_t_trans \
+  --router-mode filename \
+  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
+  --domains mix --split val \
+  --lora-checkpoint /path/to/lora/best_model.pth \
+  --output-csv filename_router_summary.csv \
+  --routing-csv filename_router_details.csv
+```
+
+Filename routing evaluates only the hybrid checkpoint; separate baseline and
+DoRA checkpoint arguments are not needed in this mode.
+
+### Image-content day/night router
+
+Train the MobileNetV3-Small router with filename-derived labels. Filenames are
+used only as training/validation targets; the trained router receives image
+pixels only.
+
+```bash
+python train_router.py \
+  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA/mix \
+  --epochs 20 --batch-size 32 --device cuda:0
+```
+
+Use its best checkpoint for content-based dynamic routing. The router resizes a
+separate copy to 224x224; the crowd-counting input keeps its original size.
+
+```bash
+python test.py \
+  --model-name swin_t_trans \
+  --router-mode classifier \
+  --router-checkpoint model/day_night_router/RUN/best_model.pth \
+  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
+  --domains mix --split val \
+  --lora-checkpoint /path/to/lora/best_model.pth \
+  --output-csv classifier_router_summary.csv \
+  --routing-csv classifier_router_details.csv
+```
+
+The routing CSV includes the filename-derived expected domain for evaluation,
+the image-router prediction and confidence, the selected adapter, and the count
+error. Runtime branch selection remains:
+
+- predicted day -> baseline + LoRA
+- predicted night -> baseline + DoRA
+
 Epoch `.tar` checkpoints contain stage, model name, optimizer, and both adapter
 settings. Best `.pth` checkpoints contain model weights; supply the DoRA and
 LoRA rank/alpha values when loading a parallel `.pth` checkpoint. The active

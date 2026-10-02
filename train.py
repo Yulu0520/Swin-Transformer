@@ -19,7 +19,7 @@ def parse_args():
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'lora'],
-        default='lora',
+        default='dora',
         help='all: baseline->DoRA->LoRA; both: baseline->DoRA')
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
@@ -29,9 +29,9 @@ def parse_args():
                         help='LoRA-stage training directory; set this explicitly')
     parser.add_argument('--lora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val',
                         help='LoRA-stage validation directory; set this explicitly')
-    parser.add_argument('--baseline-checkpoint', default='',
+    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='/home/mmslab-1080/Desktop/Dora_in_swin/model/swin_t_trans/dora/0929-012559/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for LoRA-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument('--pretrain-val-start', type=int, default=0,
                         help='first zero-based pretrain epoch eligible for validation')
     parser.add_argument('--dora-epochs', '--max-epoch', dest='dora_epochs',
-                        type=int, default=10,
+                        type=int, default=1200,
                         help='number of DoRA training epochs')
     parser.add_argument('--dora-val-epoch', '--val-epoch', dest='dora_val_epoch',
                         type=int, default=5,

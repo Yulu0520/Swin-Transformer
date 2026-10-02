@@ -8,11 +8,14 @@ import os
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.crowd import Crowd
+from datasets.day_night import build_router_transform
 from models import swin_c_multibatch as models
+from models.day_night_router import load_day_night_router, prediction_to_route
 
 
 def parse_args():
@@ -28,14 +31,25 @@ def parse_args():
                         help='optional parallel DoRA/LoRA checkpoint')
     parser.add_argument('--hybrid-route', choices=['dora', 'lora'], default='lora',
                         help='active branch when evaluating the hybrid checkpoint')
+    parser.add_argument(
+        '--router-mode', choices=['fixed', 'filename', 'classifier'],
+        default='classifier',
+        help=('fixed evaluates all requested images with --hybrid-route; '
+              'filename uses names; classifier uses image content'))
+    parser.add_argument(
+        '--router-checkpoint', default='model/day_night_router/1001-144417/best_model.pth',
+        help='trained day/night router required by --router-mode classifier')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')
     parser.add_argument('--data-root', default='SHA',
-                        help='root containing clean/, hazy/, and mix/')
-    parser.add_argument('--domains', nargs='+', choices=['clean', 'hazy', 'mix'],
-                        default=['clean', 'hazy', 'mix'])
+                        help='root containing day/, night/, and mix/')
+    parser.add_argument('--domains', nargs='+', choices=['day', 'night', 'mix'],
+                        default=['day', 'night', 'mix'])
     parser.add_argument('--split', choices=['val', 'test'], default='val')
     parser.add_argument('--output-csv', default='test_results.csv')
+    parser.add_argument(
+        '--routing-csv', default='routing_results.csv',
+        help='per-image results written when a router is used')
     parser.add_argument('--device', default='0')
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--crop-size', type=int, default=384)
@@ -200,7 +214,16 @@ def split_large_image(inputs, maximum_size=3584):
     ]
 
 
-def evaluate(model, data_dir, args, device, description):
+def route_from_filename(name):
+    """Map the mixed-dataset filename convention to an adapter route."""
+    basename = os.path.basename(name)
+    if basename.lower().startswith('night_'):
+        return 'night', 'dora'
+    return 'day', 'lora'
+
+
+def evaluate(model, data_dir, args, device, description,
+             router_mode='fixed', image_router=None, domain=None):
     if not os.path.isdir(data_dir):
         raise FileNotFoundError('Dataset directory not found: {}'.format(data_dir))
     dataset = Crowd(data_dir, args.crop_size, args.downsample_ratio,
@@ -212,21 +235,65 @@ def evaluate(model, data_dir, args, device, description):
         num_workers=args.num_workers, pin_memory=device.type == 'cuda')
 
     errors = []
+    routing_rows = []
+    route_counts = {'lora': 0, 'dora': 0}
+    router_correct = 0
+    router_transform = (build_router_transform(training=False)
+                        if router_mode == 'classifier' else None)
     with torch.inference_mode():
-        for inputs, count, _ in tqdm(
+        for inputs, count, names in tqdm(
                 loader, desc=description, dynamic_ncols=True):
+            image_name = names[0]
+            detected_domain = ''
+            route = ''
+            confidence = ''
+            expected_domain, _ = route_from_filename(image_name)
             inputs = inputs.to(device, non_blocking=device.type == 'cuda')
+            if router_mode == 'filename':
+                detected_domain, route = route_from_filename(image_name)
+                confidence = 1.0
+            elif router_mode == 'classifier':
+                image_path = os.path.join(data_dir, image_name + '.jpg')
+                with Image.open(image_path) as router_image:
+                    router_input = router_transform(
+                        router_image.convert('RGB')).unsqueeze(0).to(device)
+                detected_domain, route, confidence = prediction_to_route(
+                    image_router(router_input))
+            if router_mode != 'fixed':
+                model.set_adapter_route(route)
+                route_counts[route] += 1
+                router_correct += int(detected_domain == expected_domain)
             predicted = sum(
                 model(patch)[0].sum().item()
                 for patch in split_large_image(inputs)
             )
-            errors.append(count.item() - predicted)
+            error = count.item() - predicted
+            errors.append(error)
+            if router_mode != 'fixed':
+                routing_rows.append({
+                    'domain': domain or '',
+                    'split': args.split,
+                    'image': image_name,
+                    'expected_domain': expected_domain,
+                    'detected_domain': detected_domain,
+                    'route': route,
+                    'confidence': confidence,
+                    'router_correct': detected_domain == expected_domain,
+                    'ground_truth_count': int(count.item()),
+                    'predicted_count': predicted,
+                    'error': error,
+                    'absolute_error': abs(error),
+                })
 
     errors = np.asarray(errors, dtype=np.float64)
     return {
         'images': len(errors),
         'mae': float(np.mean(np.abs(errors))),
         'rmse': float(np.sqrt(np.mean(np.square(errors)))),
+        'route_counts': route_counts,
+        'router_accuracy': (router_correct / len(errors)
+                            if router_mode != 'fixed' else None),
+        'routing_rows': routing_rows,
     }
 
 
@@ -249,11 +316,81 @@ def write_results(rows, output_path):
         writer.writerows(rows)
 
 
+def write_routing_results(rows, output_path):
+    parent = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(parent, exist_ok=True)
+    fields = [
+        'domain', 'split', 'image', 'expected_domain', 'detected_domain',
+        'route', 'confidence', 'router_correct', 'ground_truth_count',
+        'predicted_count', 'error', 'absolute_error',
+    ]
+    with open(output_path, 'w', newline='', encoding='utf-8') as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main():
     args = parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rows = []
+    routing_rows = []
+
+    if args.router_mode in ('filename', 'classifier'):
+        if not args.lora_checkpoint:
+            raise ValueError(
+                'routing requires --lora-checkpoint containing '
+                'both the LoRA and DoRA branches')
+        if not os.path.isfile(args.lora_checkpoint):
+            raise FileNotFoundError(
+                'Checkpoint not found: {}'.format(args.lora_checkpoint))
+
+        image_router = None
+        if args.router_mode == 'classifier':
+            if not args.router_checkpoint:
+                raise ValueError(
+                    '--router-mode classifier requires --router-checkpoint')
+            image_router = load_day_night_router(args.router_checkpoint)
+            image_router.to(device).eval()
+            print('Image router checkpoint: {}'.format(
+                args.router_checkpoint))
+
+        print('Router mode: {} (day -> LoRA, night -> DoRA)'.format(
+            args.router_mode))
+        print('Hybrid checkpoint: {}'.format(args.lora_checkpoint))
+        model = build_hybrid_model(args, args.lora_checkpoint)
+        model.to(device).eval()
+        for domain in args.domains:
+            data_dir = os.path.join(args.data_root, domain, args.split)
+            metrics = evaluate(
+                model, data_dir, args, device,
+                '{} router {}'.format(args.router_mode.capitalize(), domain),
+                router_mode=args.router_mode, image_router=image_router,
+                domain=domain)
+            route_counts = metrics.pop('route_counts')
+            router_accuracy = metrics.pop('router_accuracy')
+            routing_rows.extend(metrics.pop('routing_rows'))
+            print('{}: day/LoRA={}, night/DoRA={}, router accuracy={:.2%}'.format(
+                domain, route_counts['lora'], route_counts['dora'],
+                router_accuracy))
+            rows.append({
+                'model': args.router_mode + '_router',
+                'domain': domain,
+                'split': args.split,
+                'images': metrics['images'],
+                'mae': metrics['mae'],
+                'rmse': metrics['rmse'],
+                'checkpoint': args.lora_checkpoint,
+            })
+
+        print_results(rows)
+        write_results(rows, args.output_csv)
+        write_routing_results(routing_rows, args.routing_csv)
+        print('\nCSV saved to {}'.format(os.path.abspath(args.output_csv)))
+        print('Routing CSV saved to {}'.format(
+            os.path.abspath(args.routing_csv)))
+        return
 
     baseline_checkpoint = resolve_checkpoint(
         args.baseline_checkpoint, args.checkpoint_root,
@@ -287,6 +424,9 @@ def main():
             metrics = evaluate(
                 model, data_dir, args, device,
                 '{} {}'.format(model_label.capitalize(), domain))
+            metrics.pop('route_counts')
+            metrics.pop('router_accuracy')
+            metrics.pop('routing_rows')
             rows.append({
                 'model': model_label,
                 'domain': domain,

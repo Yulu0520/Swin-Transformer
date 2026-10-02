@@ -55,6 +55,6 @@ def prediction_to_route(logits):
     probabilities = torch.softmax(logits, dim=1)
     class_index = int(probabilities.argmax(dim=1).item())
     domain = CLASS_NAMES[class_index]
-    route = 'dora' if domain == 'night' else 'lora'
+    route = 'dora' if domain == 'night' else 'dora1'
     confidence = float(probabilities[0, class_index].item())
     return domain, route, confidence

@@ -1,4 +1,4 @@
-"""Train a baseline and mutually exclusive DoRA/LoRA adapter branches."""
+"""Train a baseline and mutually exclusive DoRA/DoRA1 adapter branches."""
 
 import argparse
 import copy
@@ -18,21 +18,25 @@ def parse_args():
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
-        '--stage', choices=['all', 'both', 'baseline', 'dora', 'lora'],
-        default='dora',
-        help='all: baseline->DoRA->LoRA; both: baseline->DoRA')
+        '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
+        default='dora1',
+        help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
+    
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
+    
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
     parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
-    parser.add_argument('--lora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
-                        help='LoRA-stage training directory; set this explicitly')
-    parser.add_argument('--lora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val',
-                        help='LoRA-stage validation directory; set this explicitly')
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+
+    parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
+                        help='DoRA1-stage training directory')
+    parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
+                        help='DoRA1-stage validation directory')
+    
+    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='',
-                        help='trained DoRA .pth or .tar for LoRA-only training')
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+                        help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
                         help='official ImageNet-22K Swin-L checkpoint; also works with 256 crops')
@@ -42,14 +46,14 @@ def parse_args():
     parser.set_defaults(pretrained_backbone=True)
     parser.add_argument('--dora-rank', type=int, default=4)
     parser.add_argument('--dora-alpha', type=float, default=4.0)
-    parser.add_argument('--lora-rank', type=int, default=4)
-    parser.add_argument('--lora-alpha', type=float, default=4.0)
+    parser.add_argument('--dora1-rank', type=int, default=4)
+    parser.add_argument('--dora1-alpha', type=float, default=4.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save-dir', default='model')
     parser.add_argument('--save-all', action='store_true')
     parser.add_argument('--lr', type=float, default=5*1e-6)
     parser.add_argument('--dora-lr', type=float, default=2e-4)
-    parser.add_argument('--lora-lr', type=float, default=2e-4)
+    parser.add_argument('--dora1-lr', type=float, default=2e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-5)
     parser.add_argument('--resume', default='',
                         help='continue the selected stage from its .tar checkpoint')
@@ -62,7 +66,7 @@ def parse_args():
     parser.add_argument('--pretrain-val-start', type=int, default=0,
                         help='first zero-based pretrain epoch eligible for validation')
     parser.add_argument('--dora-epochs', '--max-epoch', dest='dora_epochs',
-                        type=int, default=1200,
+                        type=int, default=10,
                         help='number of DoRA training epochs')
     parser.add_argument('--dora-val-epoch', '--val-epoch', dest='dora_val_epoch',
                         type=int, default=5,
@@ -70,12 +74,12 @@ def parse_args():
     parser.add_argument('--dora-val-start', '--val-start', dest='dora_val_start',
                         type=int, default=0,
                         help='first zero-based DoRA epoch eligible for validation')
-    parser.add_argument('--lora-epochs', type=int, default=10,
-                        help='number of parallel LoRA-branch training epochs')
-    parser.add_argument('--lora-val-epoch', type=int, default=5,
-                        help='validate LoRA every N epochs')
-    parser.add_argument('--lora-val-start', type=int, default=0,
-                        help='first zero-based LoRA epoch eligible for validation')
+    parser.add_argument('--dora1-epochs', type=int, default=10,
+                        help='number of parallel DoRA1-branch training epochs')
+    parser.add_argument('--dora1-val-epoch', type=int, default=5,
+                        help='validate DoRA1 every N epochs')
+    parser.add_argument('--dora1-val-start', type=int, default=0,
+                        help='first zero-based DoRA1 epoch eligible for validation')
     
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--device', default='0')
@@ -92,30 +96,30 @@ def parse_args():
     args = parser.parse_args()
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
         parser.error('--stage dora needs --baseline-checkpoint or --resume')
-    if args.stage == 'lora' and not (args.dora_checkpoint or args.resume):
-        parser.error('--stage lora needs --dora-checkpoint or --resume')
-    if args.stage in ('both', 'all') and (
-            args.baseline_checkpoint or args.dora_checkpoint):
-        parser.error('pipeline stages use newly trained checkpoints; do not pass '
-                     '--baseline-checkpoint or --dora-checkpoint')
-    if args.stage in ('lora', 'all') and not (
-            args.lora_train_dir and args.lora_val_dir):
-        parser.error('--lora-train-dir and --lora-val-dir are required for '
-                     'the LoRA stage')
+    if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):
+        parser.error('--stage dora1 needs --dora-checkpoint or --resume')
+    if args.stage in ('both', 'all') and args.dora_checkpoint:
+        parser.error('pipeline stages use their newly trained DoRA checkpoint; '
+                     'do not pass --dora-checkpoint')
+    if args.stage in ('dora1', 'all') and not (
+            args.dora1_train_dir and args.dora1_val_dir):
+        parser.error('--dora1-train-dir and --dora1-val-dir are required for '
+                     'the DoRA1 stage')
     for name, epochs, val_epoch, val_start in (
         ('pretrain', args.pretrain_epochs, args.pretrain_val_epoch,
          args.pretrain_val_start),
         ('dora', args.dora_epochs, args.dora_val_epoch, args.dora_val_start),
-        ('lora', args.lora_epochs, args.lora_val_epoch, args.lora_val_start),
+        ('dora1', args.dora1_epochs, args.dora1_val_epoch,
+         args.dora1_val_start),
     ):
         if epochs <= 0 or val_epoch <= 0 or val_start < 0:
             parser.error('{} epochs and validation interval must be positive; '
                          'validation start must be nonnegative'.format(name))
         if (((args.stage in ('both', 'all') and name in ('pretrain', 'dora')) or
-             (args.stage == 'all' and name == 'lora') or
+             (args.stage == 'all' and name == 'dora1') or
              (args.stage == 'baseline' and name == 'pretrain') or
              (args.stage == 'dora' and name == 'dora') or
-             (args.stage == 'lora' and name == 'lora')) and
+             (args.stage == 'dora1' and name == 'dora1')) and
                 val_start >= epochs):
             parser.error('--{}-val-start must be less than --{}-epochs '
                          'to select a best checkpoint'.format(name, name))
@@ -123,8 +127,8 @@ def parse_args():
         parser.error('--crop-size must be positive and divisible by --downsample-ratio')
     if args.dora_rank <= 0 or args.dora_alpha <= 0:
         parser.error('DoRA rank and alpha must be positive')
-    if args.lora_rank <= 0 or args.lora_alpha <= 0:
-        parser.error('LoRA rank and alpha must be positive')
+    if args.dora1_rank <= 0 or args.dora1_alpha <= 0:
+        parser.error('DoRA1 rank and alpha must be positive')
     return args
 
 
@@ -149,17 +153,17 @@ def run_stage(args, stage, parent_checkpoint=''):
         stage_args.val_epoch = args.dora_val_epoch
         stage_args.val_start = args.dora_val_start
     else:
-        stage_args.max_epoch = args.lora_epochs
-        stage_args.val_epoch = args.lora_val_epoch
-        stage_args.val_start = args.lora_val_start
+        stage_args.max_epoch = args.dora1_epochs
+        stage_args.val_epoch = args.dora1_val_epoch
+        stage_args.val_start = args.dora1_val_start
     stage_args.save_dir = os.path.join(args.save_dir, args.model_name, stage)
     stage_args.lr = {
-        'baseline': args.lr, 'dora': args.dora_lr, 'lora': args.lora_lr,
+        'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr,
     }[stage]
     if parent_checkpoint:
         if stage == 'dora':
             stage_args.baseline_checkpoint = parent_checkpoint
-        elif stage == 'lora':
+        elif stage == 'dora1':
             stage_args.dora_checkpoint = parent_checkpoint
         stage_args.resume = ''
     seed_everything(stage_args.seed)
@@ -182,8 +186,8 @@ def run_pipeline(args):
             return best_baseline, best_dora
         gc.collect()
         torch.cuda.empty_cache()
-        best_lora = run_stage(args, 'lora', parent_checkpoint=best_dora)
-        return best_baseline, best_dora, best_lora
+        best_dora1 = run_stage(args, 'dora1', parent_checkpoint=best_dora)
+        return best_baseline, best_dora, best_dora1
     return run_stage(args, args.stage)
 
 

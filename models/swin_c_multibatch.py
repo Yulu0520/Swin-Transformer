@@ -11,9 +11,9 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
-from .swin_lora import (
-    ParallelQVAdapter,
-    add_swin_qv_parallel_adapters,
+from .swin_dual_dora import (
+    DualQVDoRAAdapter,
+    add_swin_qv_dual_dora,
     set_swin_adapter_route,
 )
 
@@ -145,30 +145,32 @@ class SwinTransMultiBatch(nn.Module):
             parameter.requires_grad_(False)
         return add_swin_qv_dora(self.backbone_features, rank, alpha)
 
-    def enable_parallel_adapters(
+    def enable_dual_dora(
             self, dora_rank=4, dora_alpha=4.0,
-            lora_rank=4, lora_alpha=4.0,
-            active_route='lora', trainable_route=None):
-        """Attach mutually exclusive DoRA/LoRA branches to backbone Q/V."""
-        count = add_swin_qv_parallel_adapters(
+            dora1_rank=4, dora1_alpha=4.0,
+            active_route='dora1', trainable_route=None):
+        """Attach mutually exclusive DoRA/DoRA1 branches to backbone Q/V."""
+        count = add_swin_qv_dual_dora(
             self.backbone_features,
-            dora_rank, dora_alpha, lora_rank, lora_alpha,
+            dora_rank, dora_alpha, dora1_rank, dora1_alpha,
             active_route=active_route,
         )
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         if trainable_route is not None:
-            if trainable_route != active_route or trainable_route not in ('dora', 'lora'):
-                raise ValueError('trainable route must match active DoRA/LoRA route')
+            if (trainable_route != active_route
+                    or trainable_route not in ('dora', 'dora1')):
+                raise ValueError(
+                    'trainable route must match active DoRA/DoRA1 route')
             for module in self.backbone_features.modules():
-                if isinstance(module, ParallelQVAdapter):
+                if isinstance(module, DualQVDoRAAdapter):
                     branch = getattr(module, trainable_route)
                     for parameter in branch.parameters():
                         parameter.requires_grad_(True)
         return count
 
     def set_adapter_route(self, route):
-        """Select baseline, DoRA, or LoRA for every Swin Q/V projection."""
+        """Select baseline, DoRA, or DoRA1 for every Swin Q/V projection."""
         return set_swin_adapter_route(self.backbone_features, route)
 
 

@@ -14,10 +14,10 @@ class DayNightRouterTest(unittest.TestCase):
         self.assertEqual(label_from_filename('IMG_1.jpg'), 0)
         self.assertEqual(label_from_filename('night_IMG_1.jpg'), 1)
 
-    def test_day_prediction_routes_to_lora(self):
+    def test_day_prediction_routes_to_dora1(self):
         domain, route, confidence = prediction_to_route(
             torch.tensor([[4.0, 1.0]]))
-        self.assertEqual((domain, route), ('day', 'lora'))
+        self.assertEqual((domain, route), ('day', 'dora1'))
         self.assertGreater(confidence, 0.5)
 
     def test_night_prediction_routes_to_dora(self):

@@ -1,53 +1,55 @@
-"""Mutually exclusive DoRA/LoRA routing for packed Swin QKV weights."""
+"""Mutually exclusive dual-DoRA routing for packed Swin QKV weights."""
 
 import math
 
-import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
 from .swin_dora import QVDoRA
 
 
-class QVLoRA(nn.Module):
-    """Apply additive LoRA to Q and V while leaving K unchanged."""
-
-    def __init__(self, weight, rank, alpha):
-        super().__init__()
-        if rank <= 0 or alpha <= 0:
-            raise ValueError('LoRA rank and alpha must be positive')
-        if weight.ndim != 2 or weight.shape[0] != 3 * weight.shape[1]:
-            raise ValueError('LoRA expects a packed square QKV weight')
-
-        dim = weight.shape[1]
-        self.scaling = alpha / rank
-        self.lora_A_q = nn.Parameter(weight.new_empty(rank, dim))
-        self.lora_B_q = nn.Parameter(weight.new_zeros(dim, rank))
-        self.lora_A_v = nn.Parameter(weight.new_empty(rank, dim))
-        self.lora_B_v = nn.Parameter(weight.new_zeros(dim, rank))
-        nn.init.kaiming_uniform_(self.lora_A_q, a=5 ** 0.5)
-        nn.init.kaiming_uniform_(self.lora_A_v, a=5 ** 0.5)
-
-    def forward(self, weight):
-        q_weight, k_weight, v_weight = weight.chunk(3, dim=0)
-        q_weight = q_weight + self.scaling * (self.lora_B_q @ self.lora_A_q)
-        v_weight = v_weight + self.scaling * (self.lora_B_v @ self.lora_A_v)
-        return torch.cat((q_weight, k_weight, v_weight), dim=0)
+LEGACY_DORA_PREFIX = '.parametrizations.weight.0.dora.'
+LEGACY_LORA_PREFIX = '.parametrizations.weight.0.lora.'
 
 
-class ParallelQVAdapter(nn.Module):
-    """Route a baseline QKV weight through exactly one adapter branch."""
+def has_legacy_dora_lora_adapters(state):
+    """Return whether a state dict uses the former DoRA/LoRA container."""
+    return (any(LEGACY_DORA_PREFIX in key for key in state)
+            and any(LEGACY_LORA_PREFIX in key for key in state))
 
-    ROUTES = ('baseline', 'dora', 'lora')
 
-    def __init__(self, dora, lora, active_route='lora'):
+def extract_dora_from_legacy_state(state):
+    """Convert a former DoRA/LoRA state dict into standalone DoRA state.
+
+    The trained DoRA and raw baseline are retained. The LoRA branch is dropped;
+    it cannot be interpreted as DoRA because it has no magnitude parameters.
+    """
+    if not has_legacy_dora_lora_adapters(state):
+        raise ValueError('State dict does not contain legacy DoRA/LoRA adapters')
+    converted = state.__class__()
+    for key, value in state.items():
+        if LEGACY_LORA_PREFIX in key:
+            continue
+        converted[key.replace(LEGACY_DORA_PREFIX,
+                              '.parametrizations.weight.0.')] = value
+    if hasattr(state, '_metadata'):
+        converted._metadata = state._metadata
+    return converted
+
+
+class DualQVDoRAAdapter(nn.Module):
+    """Route one baseline QKV weight through one of two DoRA branches."""
+
+    ROUTES = ('baseline', 'dora', 'dora1')
+
+    def __init__(self, dora, dora1, active_route='dora1'):
         super().__init__()
         if not isinstance(dora, QVDoRA):
             raise TypeError('dora must be a QVDoRA module')
-        if not isinstance(lora, QVLoRA):
-            raise TypeError('lora must be a QVLoRA module')
+        if not isinstance(dora1, QVDoRA):
+            raise TypeError('dora1 must be a QVDoRA module')
         self.dora = dora
-        self.lora = lora
+        self.dora1 = dora1
         self.set_route(active_route)
 
     def set_route(self, route):
@@ -57,12 +59,11 @@ class ParallelQVAdapter(nn.Module):
         self.active_route = route
 
     def forward(self, weight):
-        # Only the selected branch is called. The inactive adapter is absent
-        # from both the forward computation and the autograd graph.
+        # Only the selected branch participates in forward and autograd.
         if self.active_route == 'dora':
             return self.dora(weight)
-        if self.active_route == 'lora':
-            return self.lora(weight)
+        if self.active_route == 'dora1':
+            return self.dora1(weight)
         return weight
 
 
@@ -87,13 +88,14 @@ def _validate_existing_dora(dora, rank, alpha):
         raise ValueError('Existing DoRA settings do not match requested rank/alpha')
 
 
-def add_swin_qv_parallel_adapters(
-        features, dora_rank, dora_alpha, lora_rank, lora_alpha,
-        active_route='lora'):
-    """Attach parallel DoRA/LoRA branches to every Swin attention block.
+def add_swin_qv_dual_dora(
+        features, dora_rank, dora_alpha, dora1_rank, dora1_alpha,
+        active_route='dora1'):
+    """Attach parallel DoRA and DoRA1 branches to every Swin Q/V block.
 
-    An already attached DoRA branch is preserved and moved into the router.
-    Otherwise a new DoRA branch is initialized from the baseline weight.
+    If a standalone DoRA is already attached, it is preserved. Both branches
+    always receive the same raw baseline weight rather than another adapter's
+    output.
     """
     qkv_layers = _swin_qkv_layers(features)
     for qkv in qkv_layers:
@@ -105,14 +107,13 @@ def add_swin_qv_parallel_adapters(
                     'Expected exactly one DoRA parametrization before routing')
             dora = parametrizations[0]
             _validate_existing_dora(dora, dora_rank, dora_alpha)
-            # Restore the raw baseline weight, not the current DoRA result.
             parametrize.remove_parametrizations(
                 qkv, 'weight', leave_parametrized=False)
         else:
             dora = QVDoRA(qkv.weight, dora_rank, dora_alpha)
 
-        lora = QVLoRA(qkv.weight, lora_rank, lora_alpha)
-        router = ParallelQVAdapter(dora, lora, active_route)
+        dora1 = QVDoRA(qkv.weight, dora1_rank, dora1_alpha)
+        router = DualQVDoRAAdapter(dora, dora1, active_route)
         parametrize.register_parametrization(qkv, 'weight', router)
     return len(qkv_layers)
 
@@ -122,11 +123,11 @@ def set_swin_adapter_route(features, route):
     routers = []
     for qkv in _swin_qkv_layers(features):
         if not parametrize.is_parametrized(qkv, 'weight'):
-            raise ValueError('Parallel adapters are not attached')
+            raise ValueError('Dual DoRA adapters are not attached')
         parametrizations = qkv.parametrizations.weight
         if (len(parametrizations) != 1
-                or not isinstance(parametrizations[0], ParallelQVAdapter)):
-            raise ValueError('Expected exactly one ParallelQVAdapter')
+                or not isinstance(parametrizations[0], DualQVDoRAAdapter)):
+            raise ValueError('Expected exactly one DualQVDoRAAdapter')
         routers.append(parametrizations[0])
     for router in routers:
         router.set_route(route)

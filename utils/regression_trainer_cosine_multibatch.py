@@ -16,6 +16,10 @@ import logging
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
+from models.swin_dual_dora import (
+    extract_dora_from_legacy_state,
+    has_legacy_dora_lora_adapters,
+)
 from datasets.crowd import Crowd
 from losses.bay_loss import Bay_Loss
 from losses.post_prob import Post_Prob
@@ -36,9 +40,9 @@ def load_checkpoint(path):
         return torch.load(path, map_location='cpu')
 
 
-def has_parallel_adapters(state):
+def has_dual_dora_adapters(state):
     return (any('.parametrizations.weight.0.dora.' in key for key in state)
-            and any('.parametrizations.weight.0.lora.' in key for key in state))
+            and any('.parametrizations.weight.0.dora1.' in key for key in state))
 
 
 def train_collate(batch):
@@ -73,9 +77,9 @@ class RegTrainer(Trainer):
                 'train': args.dora_train_dir,
                 'val': args.dora_val_dir,
             },
-            'lora': {
-                'train': args.lora_train_dir,
-                'val': args.lora_val_dir,
+            'dora1': {
+                'train': args.dora1_train_dir,
+                'val': args.dora1_val_dir,
             },
         }
         active_roots = data_roots[args.stage]
@@ -119,53 +123,57 @@ class RegTrainer(Trainer):
                         raise ValueError('Baseline checkpoint model name does not match')
                 state = checkpoint.get('model_state_dict', checkpoint)
                 self.model.load_state_dict(state)
-            count = self.model.enable_parallel_adapters(
+            count = self.model.enable_dual_dora(
                 args.dora_rank, args.dora_alpha,
-                args.lora_rank, args.lora_alpha,
+                args.dora1_rank, args.dora1_alpha,
                 active_route='dora', trainable_route='dora')
             logging.info(
-                'Parallel DoRA/LoRA added to %d Swin blocks; only DoRA is active',
+                'Dual DoRA added to %d Swin blocks; only DoRA is active',
                 count)
-        elif args.stage == 'lora':
+        elif args.stage == 'dora1':
             if args.resume:
-                count = self.model.enable_parallel_adapters(
+                count = self.model.enable_dual_dora(
                     args.dora_rank, args.dora_alpha,
-                    args.lora_rank, args.lora_alpha,
-                    active_route='lora', trainable_route='lora')
+                    args.dora1_rank, args.dora1_alpha,
+                    active_route='dora1', trainable_route='dora1')
             else:
                 checkpoint = load_checkpoint(args.dora_checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'dora') != 'dora':
-                        raise ValueError('LoRA needs a DoRA checkpoint')
+                        raise ValueError('DoRA1 needs a DoRA checkpoint')
                     if checkpoint.get('model_name', args.model_name) != args.model_name:
                         raise ValueError('DoRA checkpoint model name does not match')
                     adapter_type = checkpoint.get('adapter_type', 'dora')
-                    if (adapter_type not in ('dora', 'parallel_dora_lora') or
+                    if (adapter_type not in (
+                            'dora', 'parallel_dora_dora1',
+                            'parallel_dora_lora') or
                             checkpoint.get('dora_rank') != args.dora_rank or
                             checkpoint.get('dora_alpha') != args.dora_alpha):
                         raise ValueError('DoRA checkpoint settings do not match')
-                    if (adapter_type == 'parallel_dora_lora' and
-                            (checkpoint.get('lora_rank') != args.lora_rank or
-                             checkpoint.get('lora_alpha') != args.lora_alpha)):
-                        raise ValueError('Frozen LoRA branch settings do not match')
+                    if (adapter_type == 'parallel_dora_dora1' and
+                            (checkpoint.get('dora1_rank') != args.dora1_rank or
+                             checkpoint.get('dora1_alpha') != args.dora1_alpha)):
+                        raise ValueError('Frozen DoRA1 settings do not match')
                 state = checkpoint.get('model_state_dict', checkpoint)
-                if has_parallel_adapters(state):
-                    count = self.model.enable_parallel_adapters(
+                if has_dual_dora_adapters(state):
+                    count = self.model.enable_dual_dora(
                         args.dora_rank, args.dora_alpha,
-                        args.lora_rank, args.lora_alpha,
-                        active_route='lora', trainable_route='lora')
+                        args.dora1_rank, args.dora1_alpha,
+                        active_route='dora1', trainable_route='dora1')
                     self.model.load_state_dict(state)
                 else:
-                    # Migrate a legacy DoRA-only checkpoint without changing
-                    # its learned branch or raw baseline weight.
+                    # Migrate standalone DoRA or the former DoRA/LoRA
+                    # container without changing trained DoRA or baseline.
+                    if has_legacy_dora_lora_adapters(state):
+                        state = extract_dora_from_legacy_state(state)
                     self.model.enable_dora(args.dora_rank, args.dora_alpha)
                     self.model.load_state_dict(state)
-                    count = self.model.enable_parallel_adapters(
+                    count = self.model.enable_dual_dora(
                         args.dora_rank, args.dora_alpha,
-                        args.lora_rank, args.lora_alpha,
-                        active_route='lora', trainable_route='lora')
+                        args.dora1_rank, args.dora1_alpha,
+                        active_route='dora1', trainable_route='dora1')
             logging.info(
-                'Parallel DoRA/LoRA active in %d Swin blocks; only LoRA is active',
+                'Dual DoRA active in %d Swin blocks; only DoRA1 is active',
                 count)
         self.model.to(self.device)
         named_trainable = [(name, parameter)
@@ -173,7 +181,7 @@ class RegTrainer(Trainer):
                            if parameter.requires_grad]
         expected_marker = {
             'dora': '.parametrizations.weight.0.dora.',
-            'lora': '.parametrizations.weight.0.lora.lora_',
+            'dora1': '.parametrizations.weight.0.dora1.',
         }.get(args.stage)
         if expected_marker is not None:
             unexpected = [name for name, _ in named_trainable
@@ -199,22 +207,14 @@ class RegTrainer(Trainer):
                     raise ValueError('Resume checkpoint stage does not match')
                 if checkpoint.get('model_name', args.model_name) != args.model_name:
                     raise ValueError('Resume checkpoint model name does not match')
-                if args.stage == 'dora' and (
-                    checkpoint.get('adapter_type') != 'parallel_dora_lora'
+                if args.stage in ('dora', 'dora1') and (
+                    checkpoint.get('adapter_type') != 'parallel_dora_dora1'
                     or checkpoint.get('dora_rank') != args.dora_rank
                     or checkpoint.get('dora_alpha') != args.dora_alpha
-                    or checkpoint.get('lora_rank') != args.lora_rank
-                    or checkpoint.get('lora_alpha') != args.lora_alpha
+                    or checkpoint.get('dora1_rank') != args.dora1_rank
+                    or checkpoint.get('dora1_alpha') != args.dora1_alpha
                 ):
                     raise ValueError('Resume checkpoint adapter settings do not match')
-                if args.stage == 'lora' and (
-                    checkpoint.get('adapter_type') != 'parallel_dora_lora'
-                    or checkpoint.get('dora_rank') != args.dora_rank
-                    or checkpoint.get('dora_alpha') != args.dora_alpha
-                    or checkpoint.get('lora_rank') != args.lora_rank
-                    or checkpoint.get('lora_alpha') != args.lora_alpha
-                ):
-                    raise ValueError('Resume checkpoint hybrid settings do not match')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 # New checkpoints store both the human-facing 1-based epoch
@@ -400,19 +400,19 @@ class RegTrainer(Trainer):
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
             'adapter_type': ({
-                'dora': 'parallel_dora_lora',
-                'lora': 'parallel_dora_lora',
+                'dora': 'parallel_dora_dora1',
+                'dora1': 'parallel_dora_dora1',
             }.get(self.args.stage)),
             'dora_rank': (self.args.dora_rank
-                          if self.args.stage in ('dora', 'lora') else 0),
+                          if self.args.stage in ('dora', 'dora1') else 0),
             'dora_alpha': (self.args.dora_alpha
-                           if self.args.stage in ('dora', 'lora') else 0),
-            'lora_rank': (self.args.lora_rank
-                          if self.args.stage in ('dora', 'lora') else 0),
-            'lora_alpha': (self.args.lora_alpha
-                           if self.args.stage in ('dora', 'lora') else 0),
+                           if self.args.stage in ('dora', 'dora1') else 0),
+            'dora1_rank': (self.args.dora1_rank
+                           if self.args.stage in ('dora', 'dora1') else 0),
+            'dora1_alpha': (self.args.dora1_alpha
+                            if self.args.stage in ('dora', 'dora1') else 0),
             'parent_dora_checkpoint': (self.args.dora_checkpoint
-                                       if self.args.stage == 'lora' else ''),
+                                       if self.args.stage == 'dora1' else ''),
             'seed': self.args.seed,
             'best_mae': self.best_mae,
             'best_mse': self.best_mse,

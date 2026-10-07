@@ -1,4 +1,4 @@
-"""Train a baseline and mutually exclusive DoRA/DoRA1 adapter branches."""
+"""Train a baseline or one Q/V+MLP DoRA branch; parallel Q/V is optional."""
 
 import argparse
 import copy
@@ -19,7 +19,7 @@ def parse_args():
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='dora1',
+        default='dora',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
@@ -35,8 +35,8 @@ def parse_args():
     
     parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
-                        help='trained DoRA .pth or .tar for DoRA1-only training')
+    parser.add_argument('--dora-checkpoint', default='',
+                        help='DoRA checkpoint for single-branch warm start or DoRA1 training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
                         help='official ImageNet-22K Swin-L checkpoint; also works with 256 crops')
@@ -48,6 +48,13 @@ def parse_args():
     parser.add_argument('--dora-alpha', type=float, default=4.0)
     parser.add_argument('--dora1-rank', type=int, default=4)
     parser.add_argument('--dora1-alpha', type=float, default=4.0)
+    parser.add_argument('--adapter-mode', choices=['single', 'parallel'], default='single',
+                        help='single disables DoRA1; parallel retains the original Q/V workflow')
+    parser.add_argument('--adapter-targets', choices=['qv', 'qv_mlp'], default='qv_mlp')
+    parser.add_argument('--mlp-dora-rank', type=int, default=4)
+    parser.add_argument('--mlp-dora-alpha', type=float, default=4.0)
+    parser.add_argument('--freeze-qv-dora', action='store_true',
+                        help='train only MLP adapters in single qv_mlp mode')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save-dir', default='model')
     parser.add_argument('--save-all', action='store_true')
@@ -94,7 +101,19 @@ def parse_args():
     parser.add_argument('--background-ratio', type=float, default=0.15)
     
     args = parser.parse_args()
-    if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
+    if args.adapter_mode == 'single' and args.stage in ('all', 'dora1'):
+        parser.error('DoRA1 is disabled in single mode; use --adapter-mode parallel --adapter-targets qv')
+    if args.adapter_mode == 'parallel' and args.adapter_targets != 'qv':
+        parser.error('parallel mode supports --adapter-targets qv only')
+    if args.freeze_qv_dora and (args.adapter_mode != 'single' or args.adapter_targets != 'qv_mlp'):
+        parser.error('--freeze-qv-dora requires single qv_mlp mode')
+    if args.resume and args.dora_checkpoint:
+        parser.error('choose --resume or --dora-checkpoint, not both')
+    if args.stage == 'dora' and args.adapter_mode == 'parallel' and args.dora_checkpoint:
+        parser.error('parallel DoRA training starts from --baseline-checkpoint')
+    if args.mlp_dora_rank <= 0 or args.mlp_dora_alpha <= 0:
+        parser.error('MLP DoRA rank and alpha must be positive')
+    if args.stage == 'dora' and not (args.baseline_checkpoint or args.dora_checkpoint or args.resume):
         parser.error('--stage dora needs --baseline-checkpoint or --resume')
     if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):
         parser.error('--stage dora1 needs --dora-checkpoint or --resume')
@@ -123,6 +142,8 @@ def parse_args():
                 val_start >= epochs):
             parser.error('--{}-val-start must be less than --{}-epochs '
                          'to select a best checkpoint'.format(name, name))
+    if args.downsample_ratio != 16:
+        parser.error('the density head requires --downsample-ratio 16')
     if args.crop_size <= 0 or args.crop_size % args.downsample_ratio:
         parser.error('--crop-size must be positive and divisible by --downsample-ratio')
     if args.dora_rank <= 0 or args.dora_alpha <= 0:

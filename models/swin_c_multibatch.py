@@ -10,7 +10,7 @@ from .transformer_cosine_multibatch import (
     TransformerEncoder,
     TransformerEncoderLayer,
 )
-from .swin_dora import add_swin_qv_dora
+from .swin_dora import QVDoRA, LinearDoRA, add_swin_qv_dora, add_swin_mlp_dora
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -139,11 +139,25 @@ class SwinTransMultiBatch(nn.Module):
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 
-    def enable_dora(self, rank=4, alpha=4.0):
-        """Freeze the clean baseline and adapt all backbone attention Q/V."""
+    def enable_dora(self, rank=4, alpha=4.0, targets='qv',
+                    mlp_rank=4, mlp_alpha=4.0, train_qv=True):
+        """Attach one branch to Q/V and optionally both MLP projections."""
+        if targets not in ('qv', 'qv_mlp'):
+            raise ValueError('DoRA targets must be qv or qv_mlp')
+        count = add_swin_qv_dora(self.backbone_features, rank, alpha)
+        if targets == 'qv_mlp':
+            add_swin_mlp_dora(self.backbone_features, mlp_rank, mlp_alpha)
+        self.configure_single_dora_training(train_qv)
+        return count
+
+    def configure_single_dora_training(self, train_qv=True):
+        """Freeze baseline/head and enable only the single adapter parameters."""
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        return add_swin_qv_dora(self.backbone_features, rank, alpha)
+        for module in self.backbone_features.modules():
+            if isinstance(module, LinearDoRA) or (train_qv and isinstance(module, QVDoRA)):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
 
     def enable_dual_dora(
             self, dora_rank=4, dora_alpha=4.0,

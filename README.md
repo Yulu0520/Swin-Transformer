@@ -1,166 +1,172 @@
-# Boosting-Crowd-Counting-via-Multifaceted-Attention
-Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted Attention'
+# Boosting Crowd Counting via Multifaceted Attention — Swin DoRA
 
-This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24
-attention blocks). The stage-4 feature is projected from 1536 to 512 channels
-and passed to the original multibatch MAN Transformer encoder and density-map
-head. The original Bayesian and cosine-consistency losses remain in use.
-The CCST count head and CCST trainer are not used.
+This project uses a Swin backbone followed by a 512-channel feature projection,
+the two-layer multibatch MAN encoder, and a density-map head. Training retains
+Bayesian and cosine-consistency losses. The original paper is
+[Boosting Crowd Counting via Multifaceted Attention](https://arxiv.org/abs/2203.02636).
+`structure.png` illustrates the original VGG-based MAN architecture.
 
-[arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
+## Current experiment: Swin-T with one Q/V + MLP DoRA branch
 
-![image](structure.png)
+The default experiment now uses **Swin-T, one DoRA branch, and no router**.
+DoRA1 is not constructed. Every image uses the same adapter, regardless of its
+filename or day/night appearance.
+
+Each of Swin-T's 12 blocks adapts:
+
+- attention Q and V; K remains unchanged;
+- MLP Linear 1 (`C -> 4C`, torchvision `mlp.0`);
+- MLP Linear 2 (`4C -> C`, torchvision `mlp.3`).
+
+The MLP adapters use independent low-rank direction factors and one magnitude
+per output channel. Their B factors start at zero; magnitudes are initialized
+from the loaded baseline weights, preserving the initial model output within
+floating-point tolerance. Biases, baseline weights, normalization layers,
+patch embedding/merging, attention output projections, feature projection,
+MAN encoder, and density head stay frozen. Only Q/V and MLP adapter parameters
+are optimized. Adapter training keeps dropout/stochastic depth in eval mode
+while allowing gradients through the frozen network.
+
+With rank 4 for both Q/V and MLP, Swin-T has **278,208 trainable adapter
+parameters**: 79,488 in Q/V and 198,720 in its 24 MLP Linear layers.
 
 ## Train
 
-Install dependencies with `pip install -r requirements.txt`. By default,
-`python train.py` first trains the full 24-block baseline on `SHA/clean/train`
-and selects its best checkpoint on `SHA/clean/val`. It then freezes that
-baseline and trains Q/V DoRA in all 24 Swin attention blocks on
-`SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
-and custom Transformer stay frozen during DoRA training.
+Install dependencies with `pip install -r requirements.txt`.
+The current defaults are `--model-name swin_t_trans --stage dora`,
+`--adapter-mode single --adapter-targets qv_mlp`, crop size 384, batch size 4,
+rank/alpha 4 for Q/V and MLP, adapter learning rate 2e-4, and 10 epochs.
+The trainer requires one CUDA GPU. Pass dataset and checkpoint paths explicitly
+when moving the project to another machine.
 
-DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
-for every Q/V output vector. K remains unchanged. The magnitude is initialized
-from the clean baseline, so attaching DoRA does not change the model output
-before adaptation starts. The parallel DoRA1 branch is present but frozen
-during this stage and is never called by the DoRA forward route.
-
-The optional third stage trains a second DoRA branch named DoRA1 in parallel
-with the trained DoRA branch. Both branches read the same frozen baseline Q/V
-weight, and exactly one branch is evaluated per forward. During DoRA1 training,
-the baseline and complete DoRA branch are frozen and DoRA is not called; only
-DoRA1's direction and magnitude parameters are optimized. Both branches start
-from the clean baseline output. K, the MAN encoder, and the density head are
-shared and frozen.
+Train Q/V + MLP adapters from an existing clean baseline:
 
 ```bash
-python train.py
-python train.py --stage baseline
 python train.py --stage dora \
-  --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth
-
-# Third stage: freeze baseline + DoRA and train only the DoRA1 branch.
-python train.py --stage dora1 \
-  --dora-checkpoint model/swin_t_trans/dora/RUN/best_model.pth \
-  --dora1-train-dir /path/to/night/train \
-  --dora1-val-dir /path/to/day/val \
+  --baseline-checkpoint /path/to/baseline/best_model.pth \
+  --dora-train-dir /path/to/night/train \
+  --dora-val-dir /path/to/mix/val \
   --dora-rank 4 --dora-alpha 4 \
-  --dora1-rank 4 --dora1-alpha 4
-
-# Run all three stages in sequence.
-python train.py --stage all \
-  --dora1-train-dir /path/to/night/train \
-  --dora1-val-dir /path/to/day/val
+  --mlp-dora-rank 4 --mlp-dora-alpha 4
 ```
 
-The default training crop is **256×256**. The official ImageNet-22K
-`swin_large_patch4_window12_384_22k.pth` is read from `pre_models/`, or from
-`--pretrained-path`. Its filename describes pretraining; it does not set this
-project's input size. The 12×12 Swin attention windows are padded as needed
-for 256×256 crops. `--no-pretrained-backbone` starts from random weights.
-The optional `--model-name swin_t_trans` retains the earlier 12-block Swin-T
-model; the default `swin_l_trans` has 24 blocks.
+Warm-start from a trained Q/V DoRA checkpoint, including an old parallel
+DoRA/DoRA1 checkpoint:
 
-Dataset paths can be changed with `--data-dir`, `--dora-train-dir`,
-`--dora-val-dir`, `--dora1-train-dir`, and `--dora1-val-dir`. The adapter
-directory names are explicit, so experiments such as night training and day
-validation do not depend on the runtime route names. Each split contains
-`.jpg` images and matching `.npy` point
-annotations. `--resume <epoch_ckpt.tar>` continues the selected stage; with
-the default `--stage both`, it resumes the baseline before DoRA starts.
-
-Training and validation progress are displayed with tqdm. TensorBoard scalar
-logs are stored under `model/<model-name>/<stage>/<run>/tensorboard/` and can be viewed with:
-
+```bash
+python train.py --stage dora \
+  --dora-checkpoint /path/to/old_dora/best_model.pth \
+  --dora-train-dir /path/to/night/train \
+  --dora-val-dir /path/to/mix/val
 ```
+
+This retains the raw baseline and trained **DoRA** branch, drops DoRA1 (or the
+legacy LoRA branch), then initializes the new MLP adapters from the loaded MLP
+weights. It starts a new optimizer and epoch schedule. For weight-only legacy
+checkpoints, supply the original Q/V rank and alpha. Metadata-bearing
+checkpoints must match the requested training settings.
+
+Add `--freeze-qv-dora` to train only MLP adapters while holding Q/V DoRA fixed.
+Use `--adapter-targets qv` for the single-branch Q/V-only comparison.
+Keep the same baseline, datasets, seed, crop, and training schedule when
+comparing Q/V-only against Q/V + MLP; the latter has more trainable parameters.
+
+To train a baseline first and then the single adapter:
+
+```bash
+python train.py --stage both --data-dir /path/to/day \
+  --dora-train-dir /path/to/night/train --dora-val-dir /path/to/mix/val
+```
+
+The baseline root must contain `train/` and `val/`. Each crowd-counting split
+contains `.jpg` images and matching `.npy` point annotations; training
+annotations include the nearest-neighbor distance column. Validation uses
+full images. The density head has stride 16, so `--downsample-ratio` must be 16.
+
+Resume a matching single-branch epoch checkpoint with:
+
+```bash
+python train.py --stage dora --resume /path/to/run/5_ckpt.tar
+```
+
+Rank/alpha, targets, and `--freeze-qv-dora` must match. Use
+`--dora-checkpoint` for old-architecture migration rather than `--resume`.
+The epoch `.tar` retains optimizer state. A `.pth` resume restores weights
+only and starts a new schedule.
+
+Both single-branch best `.pth` and epoch `.tar` checkpoints contain model name,
+targets, Q/V and MLP rank/alpha, and checkpoint format version. Best `.pth`
+files use a `model_state_dict` wrapper rather than the old raw state dict;
+use the project loaders to read them. Partial or mismatched weights are
+rejected with strict loading.
+
+Epochs are displayed as 1-based. Validation start indices are zero-based;
+defaults validate after epochs 1 and 6 in a 10-epoch run. Logs and checkpoints
+are saved under `model/<model-name>/<stage>/<run>/`.
+
+```bash
 tensorboard --logdir model
 ```
 
-Epoch numbers shown in logs, progress bars, TensorBoard, and checkpoint names
-are 1-based. The two stages have separate schedules:
+Swin-L remains available through `--model-name swin_l_trans`. Baseline
+pretraining reads the official ImageNet-22K checkpoint from
+`--pretrained-path` (default `pre_models/swin_large_patch4_window12_384_22k.pth`).
+Swin-T uses torchvision's ImageNet weights. `--no-pretrained-backbone` disables
+ImageNet initialization for baseline training.
 
-| Stage | Epochs | Validate every | First validation index |
-| --- | ---: | ---: | ---: |
-| Clean baseline | `--pretrain-epochs 500` | `--pretrain-val-epoch 5` | `--pretrain-val-start 100` |
-| Hazy/mix DoRA | `--dora-epochs 1200` | `--dora-val-epoch 5` | `--dora-val-start 500` |
+## Test without a router
 
-The validation starts are **zero-based**. With these defaults, baseline first
-validates after epoch 101 and DoRA first validates after epoch 501. `--max-epoch`,
-`--val-epoch`, and `--val-start` are aliases for the three DoRA options.
-
-
-## Test
+The default evaluates **only one DoRA checkpoint**. No separate baseline,
+DoRA1, or router checkpoint is required. The saved target and rank/alpha
+metadata reconstructs the correct architecture automatically.
 
 ```bash
-python test.py --data-root SHA --split val \
-  --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth \
-  --dora-checkpoint model/swin_l_trans/dora/RUN/best_model.pth \
-  --dora1-checkpoint model/swin_l_trans/dora1/RUN/best_model.pth \
-  --dora-rank 4 --dora-alpha 4 \
-  --dora1-rank 4 --dora1-alpha 4 \
-  --dual-route dora1
+python test.py --dora-checkpoint /path/to/new_run/best_model.pth \
+  --data-root /path/to/SHA --domains day night mix --split val \
+  --output-csv single_dora_results.csv
 ```
 
-To route every mixed-set image by its filename, use a DoRA1-stage dual-DoRA
-checkpoint. Files named `IMG_*` use the baseline+DoRA1 branch, while files named
-`night_IMG_*` use the baseline+DoRA branch. The summary CSV contains overall
-MAE/RMSE; the routing CSV records the selected branch and count error for every
-image.
+If `--dora-checkpoint` is omitted, the latest best checkpoint under
+`model/swin_t_trans/dora/` is used. For raw legacy `.pth` weights, supply
+`--dora-rank`/`--dora-alpha` and, if applicable,
+`--mlp-dora-rank`/`--mlp-dora-alpha`. Old dual checkpoints are evaluated through
+the retained DoRA branch only. The summary CSV contains per-domain MAE/RMSE;
+no routing CSV is written in single mode.
+
+`save_attention.py` and `save_density_and_var.py` accept the same adapter
+rank/alpha arguments and load baseline or single-adapter checkpoints in eval
+mode. They also extract the DoRA branch from old parallel checkpoints.
+
+## Optional original parallel Q/V workflow
+
+The old router and DoRA1 code remains available explicitly. It supports Q/V
+adapters only; parallel MLP adapters are not part of this experiment.
 
 ```bash
-python test.py \
-  --model-name swin_t_trans \
-  --router-mode filename \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
-  --domains mix --split val \
-  --dora1-checkpoint /path/to/dora1/best_model.pth \
-  --output-csv filename_router_summary.csv \
-  --routing-csv filename_router_details.csv
+python train.py --adapter-mode parallel --adapter-targets qv --stage dora1 \
+  --dora-checkpoint /path/to/parallel_dora/best_model.pth \
+  --dora1-train-dir /path/to/night/train --dora1-val-dir /path/to/day/val
+
+python test.py --evaluation-mode compare --router-mode classifier \
+  --router-checkpoint /path/to/router/best_model.pth \
+  --dora1-checkpoint /path/to/parallel_dora1/best_model.pth \
+  --data-root /path/to/SHA --domains mix
 ```
 
-Filename routing evaluates only the dual-DoRA checkpoint; separate baseline and
-DoRA checkpoint arguments are not needed in this mode.
+The old routing convention remains day -> DoRA1 and night -> DoRA. To compare
+baseline, DoRA, and optional parallel checkpoints without routing, use
+`--evaluation-mode compare --router-mode fixed` and the corresponding explicit
+checkpoint arguments. The standalone router is trained with `train_router.py`.
 
-### Image-content day/night router
-
-Train the MobileNetV3-Small router with filename-derived labels. Filenames are
-used only as training/validation targets; the trained router receives image
-pixels only.
+## Verification
 
 ```bash
-python train_router.py \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA/mix \
-  --epochs 20 --batch-size 32 --device cuda:0
+python -m unittest discover -s tests -v
 ```
 
-Use its best checkpoint for content-based dynamic routing. The router resizes a
-separate copy to 224x224; the crowd-counting input keeps its original size.
-
-```bash
-python test.py \
-  --model-name swin_t_trans \
-  --router-mode classifier \
-  --router-checkpoint model/day_night_router/RUN/best_model.pth \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
-  --domains mix --split val \
-  --dora1-checkpoint /path/to/dora1/best_model.pth \
-  --output-csv classifier_router_summary.csv \
-  --routing-csv classifier_router_details.csv
-```
-
-The routing CSV includes the filename-derived expected domain for evaluation,
-the image-router prediction and confidence, the selected adapter, and the count
-error. Runtime branch selection remains:
-
-- predicted day -> baseline + DoRA1
-- predicted night -> baseline + DoRA
-
-Epoch `.tar` checkpoints contain stage, model name, optimizer, and both adapter
-settings. Best `.pth` checkpoints contain model weights; supply the DoRA and
-DoRA1 rank/alpha values when loading a parallel `.pth` checkpoint. The active
-route is selected at runtime and is not stored as a learned parameter.
-
+Tests cover real Swin-T initial-output preservation, 12 Q/V + 24 MLP adapter
+counts, gradients and frozen weights, single-branch migration, checkpoint
+round trips with nondefault alpha, and router-free evaluation.
 
 ## Citation
 If you use this code for your research, please cite our paper:

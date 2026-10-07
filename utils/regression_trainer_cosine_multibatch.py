@@ -16,6 +16,10 @@ import logging
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
+from models.swin_checkpoint import (
+    load_single_dora, single_dora_config, read_checkpoint as load_checkpoint,
+)
+from models.swin_dora import QVDoRA, LinearDoRA
 from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
@@ -31,13 +35,6 @@ def seed_worker(worker_id):
     seed = torch.initial_seed() % (2 ** 32)
     random.seed(seed)
     np.random.seed(seed)
-
-
-def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
 
 
 def has_dual_dora_adapters(state):
@@ -113,7 +110,43 @@ class RegTrainer(Trainer):
                           and not args.resume)
         self.model = model_builder(pretrained=use_pretrained,
                                    pretrained_path=args.pretrained_path)
-        if args.stage == 'dora':
+        self.single_dora = args.stage == 'dora' and args.adapter_mode == 'single'
+        if self.single_dora:
+            if args.resume or args.dora_checkpoint:
+                checkpoint = load_checkpoint(args.resume or args.dora_checkpoint)
+                if checkpoint.get('model_name', args.model_name) != args.model_name:
+                    raise ValueError('Checkpoint model name does not match')
+                _, saved_config = single_dora_config(
+                    checkpoint, args.dora_rank, args.dora_alpha,
+                    args.mlp_dora_rank, args.mlp_dora_alpha)
+                requested = self.single_adapter_config()
+                keys = ('dora_rank', 'dora_alpha')
+                if saved_config['adapter_targets'] == 'qv_mlp':
+                    keys += ('mlp_dora_rank', 'mlp_dora_alpha')
+                if any(saved_config[key] != requested[key] for key in keys):
+                    raise ValueError('Warm-start checkpoint rank/alpha settings do not match')
+                if args.resume:
+                    if (checkpoint.get('adapter_type') != 'single_dora'
+                            or checkpoint.get('stage') != 'dora'
+                            or any(checkpoint.get(key) != value
+                                   for key, value in requested.items())):
+                        raise ValueError('Resume needs matching single DoRA settings; use --dora-checkpoint for migration')
+                load_single_dora(
+                    self.model, checkpoint, args.dora_rank, args.dora_alpha,
+                    args.mlp_dora_rank, args.mlp_dora_alpha,
+                    targets=args.adapter_targets, train_qv=not args.freeze_qv_dora)
+            else:
+                checkpoint = load_checkpoint(args.baseline_checkpoint)
+                if (checkpoint.get('stage', 'baseline') != 'baseline'
+                        or checkpoint.get('model_name', args.model_name) != args.model_name):
+                    raise ValueError('Expected a matching baseline checkpoint')
+                self.model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
+                self.model.enable_dora(
+                    args.dora_rank, args.dora_alpha, targets=args.adapter_targets,
+                    mlp_rank=args.mlp_dora_rank, mlp_alpha=args.mlp_dora_alpha,
+                    train_qv=not args.freeze_qv_dora)
+            logging.info('Single DoRA enabled: targets=%s; DoRA1 is not constructed', args.adapter_targets)
+        elif args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -183,7 +216,16 @@ class RegTrainer(Trainer):
             'dora': '.parametrizations.weight.0.dora.',
             'dora1': '.parametrizations.weight.0.dora1.',
         }.get(args.stage)
-        if expected_marker is not None:
+        if self.single_dora:
+            allowed = {id(parameter) for module in self.model.backbone_features.modules()
+                       if isinstance(module, LinearDoRA) or
+                       (not args.freeze_qv_dora and isinstance(module, QVDoRA))
+                       for parameter in module.parameters()}
+            unexpected = [name for name, parameter in named_trainable
+                          if id(parameter) not in allowed]
+            if unexpected or not named_trainable:
+                raise RuntimeError('Unexpected single DoRA trainable parameters: {}'.format(unexpected))
+        elif expected_marker is not None:
             unexpected = [name for name, _ in named_trainable
                           if expected_marker not in name]
             if unexpected or not named_trainable:
@@ -207,7 +249,7 @@ class RegTrainer(Trainer):
                     raise ValueError('Resume checkpoint stage does not match')
                 if checkpoint.get('model_name', args.model_name) != args.model_name:
                     raise ValueError('Resume checkpoint model name does not match')
-                if args.stage in ('dora', 'dora1') and (
+                if not self.single_dora and args.stage in ('dora', 'dora1') and (
                     checkpoint.get('adapter_type') != 'parallel_dora_dora1'
                     or checkpoint.get('dora_rank') != args.dora_rank
                     or checkpoint.get('dora_alpha') != args.dora_alpha
@@ -225,7 +267,8 @@ class RegTrainer(Trainer):
                 else:
                     self.start_epoch = checkpoint['epoch'] + 1
             elif suf == 'pth':
-                self.model.load_state_dict(load_checkpoint(args.resume))
+                checkpoint = load_checkpoint(args.resume)
+                self.model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
 
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
@@ -390,6 +433,24 @@ class RegTrainer(Trainer):
             )
         )
 
+    def single_adapter_config(self):
+        return {
+            'adapter_targets': self.args.adapter_targets,
+            'dora_rank': self.args.dora_rank,
+            'dora_alpha': self.args.dora_alpha,
+            'mlp_dora_rank': self.args.mlp_dora_rank,
+            'mlp_dora_alpha': self.args.mlp_dora_alpha,
+            'freeze_qv_dora': self.args.freeze_qv_dora,
+        }
+
+    def best_checkpoint(self, state):
+        if not self.single_dora:
+            return state
+        return dict(self.single_adapter_config(),
+                    checkpoint_version=2, adapter_type='single_dora',
+                    model_name=self.args.model_name, stage='dora',
+                    crop_size=self.args.crop_size, model_state_dict=state)
+
     def save_epoch(self):
         model_state_dic = self.model.state_dict()
         save_path = os.path.join(self.save_dir, '{}_ckpt.tar'.format(self.epoch))
@@ -399,7 +460,12 @@ class RegTrainer(Trainer):
             'model_name': self.args.model_name,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
-            'adapter_type': ({
+            'checkpoint_version': 2,
+            'adapter_targets': self.args.adapter_targets if self.single_dora else 'qv',
+            'mlp_dora_rank': self.args.mlp_dora_rank if self.single_dora else 0,
+            'mlp_dora_alpha': self.args.mlp_dora_alpha if self.single_dora else 0,
+            'freeze_qv_dora': self.args.freeze_qv_dora if self.single_dora else False,
+            'adapter_type': ('single_dora' if self.single_dora else {
                 'dora': 'parallel_dora_dora1',
                 'dora1': 'parallel_dora_dora1',
             }.get(self.args.stage)),
@@ -408,14 +474,14 @@ class RegTrainer(Trainer):
             'dora_alpha': (self.args.dora_alpha
                            if self.args.stage in ('dora', 'dora1') else 0),
             'dora1_rank': (self.args.dora1_rank
-                           if self.args.stage in ('dora', 'dora1') else 0),
+                           if self.args.stage in ('dora', 'dora1') and not self.single_dora else 0),
             'dora1_alpha': (self.args.dora1_alpha
-                            if self.args.stage in ('dora', 'dora1') else 0),
+                            if self.args.stage in ('dora', 'dora1') and not self.single_dora else 0),
             'parent_dora_checkpoint': (self.args.dora_checkpoint
-                                       if self.args.stage == 'dora1' else ''),
+                                       if self.args.stage in ('dora', 'dora1') else ''),
             'seed': self.args.seed,
-            'best_mae': self.best_mae,
-            'best_mse': self.best_mse,
+            'best_mae': float(self.best_mae),
+            'best_mse': float(self.best_mse),
             'best_model_path': self.best_model_path,
             'best_count': self.best_count,
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -508,11 +574,11 @@ class RegTrainer(Trainer):
             if self.save_all:
                 self.best_model_path = os.path.join(
                     self.save_dir, 'best_model_{}.pth'.format(self.best_count))
-                torch.save(model_state_dic, self.best_model_path)
+                torch.save(self.best_checkpoint(model_state_dic), self.best_model_path)
                 self.best_count += 1
             else:
                 self.best_model_path = os.path.join(self.save_dir, 'best_model.pth')
-                torch.save(model_state_dic, self.best_model_path)
+                torch.save(self.best_checkpoint(model_state_dic), self.best_model_path)
 
         self.writer.add_scalar('best/mae', self.best_mae, self.epoch)
         self.writer.add_scalar('best/rmse', self.best_mse, self.epoch)

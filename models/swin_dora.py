@@ -62,3 +62,51 @@ def add_swin_qv_dora(features, rank, alpha):
         parametrize.register_parametrization(
             qkv, 'weight', QVDoRA(qkv.weight, rank, alpha))
     return len(blocks)
+
+
+class LinearDoRA(nn.Module):
+    """DoRA for a rectangular Linear weight; the original bias is untouched."""
+
+    def __init__(self, weight, rank, alpha):
+        super().__init__()
+        if rank <= 0 or alpha <= 0 or weight.ndim != 2:
+            raise ValueError('Linear DoRA needs a matrix and positive rank/alpha')
+        out_dim, in_dim = weight.shape
+        self.scaling = alpha / rank
+        self.dora_A = nn.Parameter(weight.new_empty(rank, in_dim))
+        self.dora_B = nn.Parameter(weight.new_zeros(out_dim, rank))
+        nn.init.kaiming_uniform_(self.dora_A, a=5 ** 0.5)
+        self.magnitude = nn.Parameter(
+            torch.linalg.vector_norm(weight.detach(), dim=1))
+
+    def forward(self, weight):
+        return QVDoRA._compose(
+            weight, self.scaling * (self.dora_B @ self.dora_A), self.magnitude)
+
+
+def add_swin_mlp_dora(features, rank=4, alpha=4.0):
+    """Attach to the two MLP Linear layers inside each Swin block only."""
+    blocks = [module for module in features.modules()
+              if hasattr(module, 'attn') and hasattr(module.attn, 'qkv')]
+    if not blocks:
+        raise ValueError('No Swin attention blocks found')
+    layers = []
+    for block in blocks:
+        if not hasattr(block, 'mlp'):
+            raise ValueError('Swin block is missing its MLP')
+        linear = [module for module in block.mlp.modules()
+                  if isinstance(module, nn.Linear)]
+        dim = block.attn.qkv.in_features
+        if (len(linear) != 2 or linear[0].in_features != dim
+                or linear[0].out_features != 4 * dim
+                or linear[1].in_features != 4 * dim
+                or linear[1].out_features != dim):
+            raise ValueError('Expected Swin MLP dimensions C -> 4C -> C')
+        layers.extend(linear)
+    for layer in layers:
+        if parametrize.is_parametrized(layer, 'weight'):
+            raise ValueError('DoRA is already attached to a Swin MLP')
+    for layer in layers:
+        parametrize.register_parametrization(
+            layer, 'weight', LinearDoRA(layer.weight, rank, alpha))
+    return len(layers)

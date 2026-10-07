@@ -1,4 +1,4 @@
-"""Compare baseline, DoRA, and optional dual-DoRA checkpoints."""
+"""Evaluate one fixed DoRA model, or explicitly select legacy comparisons."""
 
 import argparse
 import csv
@@ -15,11 +15,8 @@ from tqdm import tqdm
 from datasets.crowd import Crowd
 from datasets.day_night import build_router_transform
 from models import swin_c_multibatch as models
+from models.swin_checkpoint import load_single_dora, read_checkpoint as load_checkpoint
 from models.day_night_router import load_day_night_router, prediction_to_route
-from models.swin_dual_dora import (
-    extract_dora_from_legacy_state,
-    has_legacy_dora_lora_adapters,
-)
 
 
 def parse_args():
@@ -31,17 +28,17 @@ def parse_args():
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--dora-checkpoint', default='',
                         help='DoRA checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1002-132111/best_model.pth',
+    parser.add_argument('--dora1-checkpoint', default='',
                         help='optional parallel DoRA/DoRA1 checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
                         help='active branch when evaluating the dual checkpoint')
     parser.add_argument(
         '--router-mode', choices=['fixed', 'filename', 'classifier'],
-        default='classifier',
+        default='fixed',
         help=('fixed evaluates all requested images with --dual-route; '
               'filename uses names; classifier uses image content'))
     parser.add_argument(
-        '--router-checkpoint', default='model/day_night_router/1001-144417/best_model.pth',
+        '--router-checkpoint', default='',
         help='trained day/night router required by --router-mode classifier')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')
@@ -59,21 +56,25 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=384)
     parser.add_argument('--downsample-ratio', type=int, default=16)
     parser.add_argument('--dora-rank', type=int, default=4,
-                        help='required when the DoRA checkpoint is a .pth file')
+                        help='rank for legacy weight-only checkpoints')
     parser.add_argument('--dora-alpha', type=float, default=4.0,
-                        help='must match training for a DoRA .pth checkpoint')
+                        help='alpha for legacy weight-only checkpoints')
     parser.add_argument('--dora1-rank', type=int, default=4,
                         help='required when the dual checkpoint is a .pth file')
     parser.add_argument('--dora1-alpha', type=float, default=4.0,
                         help='must match training for a dual .pth checkpoint')
-    return parser.parse_args()
-
-
-def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
+    parser.add_argument('--evaluation-mode', choices=['single', 'compare'], default='single',
+                        help='single evaluates only DoRA and disables all routing')
+    parser.add_argument('--mlp-dora-rank', type=int, default=4)
+    parser.add_argument('--mlp-dora-alpha', type=float, default=4.0)
+    args = parser.parse_args()
+    if args.evaluation_mode == 'single' and args.router_mode != 'fixed':
+        parser.error('single evaluation disables routing; use --evaluation-mode compare for old router workflows')
+    if args.evaluation_mode == 'single' and (args.dora1_checkpoint or args.baseline_checkpoint):
+        parser.error('single evaluation takes only --dora-checkpoint')
+    if args.downsample_ratio != 16:
+        parser.error('the density head requires --downsample-ratio 16')
+    return args
 
 
 def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
@@ -94,67 +95,19 @@ def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
 
 def build_model(args, checkpoint_path, expect_dora):
     checkpoint = load_checkpoint(checkpoint_path)
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        if checkpoint.get('model_name', args.model_name) != args.model_name:
-            raise ValueError(
-                '{} model name does not match --model-name'.format(checkpoint_path))
-        expected_stage = 'dora' if expect_dora else 'baseline'
-        if checkpoint.get('stage', expected_stage) != expected_stage:
-            raise ValueError(
-                '{} checkpoint stage does not match {}'.format(
-                    checkpoint_path, expected_stage))
-        if (expect_dora and checkpoint.get('adapter_type', 'dora') not in
-                ('dora', 'parallel_dora_dora1', 'parallel_dora_lora')):
-            raise ValueError('{} is not a DoRA checkpoint'.format(checkpoint_path))
-        state = checkpoint['model_state_dict']
-        rank = checkpoint.get('dora_rank', 0)
-        alpha = checkpoint.get('dora_alpha', args.dora_alpha)
-        dora1_rank = checkpoint.get('dora1_rank', args.dora1_rank)
-        dora1_alpha = checkpoint.get('dora1_alpha', args.dora1_alpha)
-    else:
-        state = checkpoint
-        rank = args.dora_rank if expect_dora else 0
-        alpha = args.dora_alpha
-        dora1_rank, dora1_alpha = args.dora1_rank, args.dora1_alpha
-
-    dora_markers = (
-        'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
-        'magnitude_q', 'magnitude_v',
-    )
-    contains_parametrization = any(
-        '.parametrizations.weight.' in key for key in state)
-    contains_dora = all(
-        any(marker in key for key in state) for marker in dora_markers)
-    contains_parallel = (
-        any('.parametrizations.weight.0.dora.' in key for key in state)
-        and any('.parametrizations.weight.0.dora1.' in key for key in state)
-    )
-    contains_legacy_parallel = has_legacy_dora_lora_adapters(state)
-    if expect_dora:
-        if not contains_dora:
-            raise ValueError(
-                '{} does not contain a complete DoRA adapter'.format(
-                    checkpoint_path))
-        if not rank:
-            raise ValueError(
-                'DoRA .pth checkpoint needs --dora-rank and --dora-alpha')
-    elif contains_parametrization or rank:
-        raise ValueError(
-            '{} contains an adapter and is not a baseline checkpoint'.format(
-                checkpoint_path))
-
+    if checkpoint.get('model_name', args.model_name) != args.model_name:
+        raise ValueError('Checkpoint model name does not match --model-name')
     model = getattr(models, args.model_name)(pretrained=False)
     if expect_dora:
-        if contains_parallel:
-            model.enable_dual_dora(
-                rank, alpha, dora1_rank, dora1_alpha, active_route='dora')
-        else:
-            model.enable_dora(rank, alpha)
-            if contains_legacy_parallel:
-                state = extract_dora_from_legacy_state(state)
-    model.load_state_dict(state)
-    if expect_dora and contains_parallel:
-        model.set_adapter_route('dora')
+        load_single_dora(
+            model, checkpoint, args.dora_rank, args.dora_alpha,
+            args.mlp_dora_rank, args.mlp_dora_alpha)
+    else:
+        state = checkpoint.get('model_state_dict', checkpoint)
+        if (checkpoint.get('stage', 'baseline') != 'baseline'
+                or any('.parametrizations.weight.' in key for key in state)):
+            raise ValueError('Expected a baseline checkpoint without adapters')
+        model.load_state_dict(state, strict=True)
     return model
 
 
@@ -345,6 +298,26 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rows = []
     routing_rows = []
+
+    if args.evaluation_mode == 'single':
+        checkpoint_path = resolve_checkpoint(
+            args.dora_checkpoint, args.checkpoint_root, args.model_name, 'dora')
+        model = build_model(args, checkpoint_path, expect_dora=True)
+        model.to(device).eval()
+        print('Single DoRA checkpoint: {}'.format(checkpoint_path))
+        for domain in args.domains:
+            metrics = evaluate(
+                model, os.path.join(args.data_root, domain, args.split),
+                args, device, 'Single DoRA {}'.format(domain))
+            rows.append({
+                'model': 'single_dora', 'domain': domain, 'split': args.split,
+                'images': metrics['images'], 'mae': metrics['mae'],
+                'rmse': metrics['rmse'], 'checkpoint': checkpoint_path,
+            })
+        print_results(rows)
+        write_results(rows, args.output_csv)
+        print('CSV saved to {}'.format(os.path.abspath(args.output_csv)))
+        return
 
     if args.router_mode in ('filename', 'classifier'):
         if not args.dora1_checkpoint:

@@ -2,6 +2,7 @@ import torch
 import os
 import numpy as np
 from models.swin_c_multibatch import swin_t_trans
+from models.swin_checkpoint import restore_swin_weights, read_checkpoint
 from glob import glob
 from torchvision import transforms
 from PIL import Image
@@ -19,6 +20,10 @@ def parse_args():
                         help='training data directory')
     parser.add_argument('--model-path', default='model/best_model.pth',
                         help='model directory')
+    parser.add_argument('--dora-rank', type=int, default=4)
+    parser.add_argument('--dora-alpha', type=float, default=4.0)
+    parser.add_argument('--mlp-dora-rank', type=int, default=4)
+    parser.add_argument('--mlp-dora-alpha', type=float, default=4.0)
     parser.add_argument('--device', default='0', help='assign device')
     args = parser.parse_args()
     return args
@@ -50,8 +55,10 @@ if __name__ == '__main__':
 
     device = torch.device('cuda')
     model = swin_t_trans(pretrained=False)
-    model.to(device)
-    model.load_state_dict(torch.load(args.model_path, device))
+    checkpoint = read_checkpoint(args.model_path)
+    restore_swin_weights(model, checkpoint, args.dora_rank, args.dora_alpha,
+                         args.mlp_dora_rank, args.mlp_dora_alpha)
+    model.to(device).eval()
     epoch_minus = []
     num = 0
 

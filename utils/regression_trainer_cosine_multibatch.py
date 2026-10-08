@@ -122,7 +122,7 @@ class RegTrainer(Trainer):
                     if checkpoint.get('model_name', args.model_name) != args.model_name:
                         raise ValueError('Baseline checkpoint model name does not match')
                 state = checkpoint.get('model_state_dict', checkpoint)
-                self.model.load_state_dict(state)
+                self.model.load_compatible_state_dict(state)
             count = self.model.enable_dual_dora(
                 args.dora_rank, args.dora_alpha,
                 args.dora1_rank, args.dora1_alpha,
@@ -160,14 +160,14 @@ class RegTrainer(Trainer):
                         args.dora_rank, args.dora_alpha,
                         args.dora1_rank, args.dora1_alpha,
                         active_route='dora1', trainable_route='dora1')
-                    self.model.load_state_dict(state)
+                    self.model.load_compatible_state_dict(state)
                 else:
                     # Migrate standalone DoRA or the former DoRA/LoRA
                     # container without changing trained DoRA or baseline.
                     if has_legacy_dora_lora_adapters(state):
                         state = extract_dora_from_legacy_state(state)
                     self.model.enable_dora(args.dora_rank, args.dora_alpha)
-                    self.model.load_state_dict(state)
+                    self.model.load_compatible_state_dict(state)
                     count = self.model.enable_dual_dora(
                         args.dora_rank, args.dora_alpha,
                         args.dora1_rank, args.dora1_alpha,
@@ -179,13 +179,15 @@ class RegTrainer(Trainer):
         named_trainable = [(name, parameter)
                            for name, parameter in self.model.named_parameters()
                            if parameter.requires_grad]
-        expected_marker = {
-            'dora': '.parametrizations.weight.0.dora.',
-            'dora1': '.parametrizations.weight.0.dora1.',
+        expected_markers = {
+            route: (
+                '.parametrizations.weight.0.{}.'.format(route),
+                '.parametrizations.in_proj_weight.0.{}.'.format(route),
+            ) for route in ('dora', 'dora1')
         }.get(args.stage)
-        if expected_marker is not None:
+        if expected_markers is not None:
             unexpected = [name for name, _ in named_trainable
-                          if expected_marker not in name]
+                          if not any(marker in name for marker in expected_markers)]
             if unexpected or not named_trainable:
                 raise RuntimeError(
                     '{} stage has unexpected trainable parameters: {}'.format(
@@ -215,7 +217,14 @@ class RegTrainer(Trainer):
                     or checkpoint.get('dora1_alpha') != args.dora1_alpha
                 ):
                     raise ValueError('Resume checkpoint adapter settings do not match')
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                if (args.stage in ('dora', 'dora1') and not any(
+                        '.parametrizations.in_proj_weight.' in key
+                        for key in checkpoint['model_state_dict'])):
+                    raise ValueError(
+                        'Old Swin-only optimizer cannot resume with MAN DoRA; '
+                        'start a new stage using --baseline-checkpoint or '
+                        '--dora-checkpoint instead of --resume')
+                self.model.load_compatible_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 # New checkpoints store both the human-facing 1-based epoch
                 # and its internal 0-based index. Older checkpoints only have
@@ -225,7 +234,7 @@ class RegTrainer(Trainer):
                 else:
                     self.start_epoch = checkpoint['epoch'] + 1
             elif suf == 'pth':
-                self.model.load_state_dict(load_checkpoint(args.resume))
+                self.model.load_compatible_state_dict(load_checkpoint(args.resume))
 
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
@@ -403,6 +412,9 @@ class RegTrainer(Trainer):
                 'dora': 'parallel_dora_dora1',
                 'dora1': 'parallel_dora_dora1',
             }.get(self.args.stage)),
+            'man_dora_projections': (['global_q', 'global_v', 'local_left_q',
+                                      'local_right_q', 'local_q']
+                                     if self.args.stage in ('dora', 'dora1') else []),
             'dora_rank': (self.args.dora_rank
                           if self.args.stage in ('dora', 'dora1') else 0),
             'dora_alpha': (self.args.dora_alpha

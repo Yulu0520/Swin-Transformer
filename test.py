@@ -152,7 +152,7 @@ def build_model(args, checkpoint_path, expect_dora):
             model.enable_dora(rank, alpha)
             if contains_legacy_parallel:
                 state = extract_dora_from_legacy_state(state)
-    model.load_state_dict(state)
+    model.load_compatible_state_dict(state)
     if expect_dora and contains_parallel:
         model.set_adapter_route('dora')
     return model
@@ -198,7 +198,7 @@ def build_dual_dora_model(args, checkpoint_path):
     model.enable_dual_dora(
         dora_rank, dora_alpha, dora1_rank, dora1_alpha,
         active_route=args.dual_route)
-    model.load_state_dict(state)
+    model.load_compatible_state_dict(state)
     model.set_adapter_route(args.dual_route)
     return model
 

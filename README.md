@@ -18,7 +18,8 @@ Install dependencies with `pip install -r requirements.txt`. By default,
 and selects its best checkpoint on `SHA/clean/val`. It then freezes that
 baseline and trains Q/V DoRA in all 24 Swin attention blocks on
 `SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
-and custom Transformer stay frozen during DoRA training.
+stays frozen during DoRA training; the custom Transformer now has its own
+DoRA adapters as described below.
 
 DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
 for every Q/V output vector. K remains unchanged. The magnitude is initialized
@@ -31,8 +32,37 @@ with the trained DoRA branch. Both branches read the same frozen baseline Q/V
 weight, and exactly one branch is evaluated per forward. During DoRA1 training,
 the baseline and complete DoRA branch are frozen and DoRA is not called; only
 DoRA1's direction and magnitude parameters are optimized. Both branches start
-from the clean baseline output. K, the MAN encoder, and the density head are
-shared and frozen.
+from the clean baseline output. K weights, MAN base weights, and the density
+head are shared and frozen. The selected MAN adapter branch is trainable.
+
+### MAN encoder DoRA
+
+Both MAN encoder layers now adapt five projections: `global_q`, `global_v`
+(the shared value projection), `local_left_q`, `local_right_q`, and `local_q`.
+The four K projections, input biases, `out_proj`, feed-forward layers,
+LayerNorms, feature adapter, and density head remain frozen in adapter stages.
+Each selected 512x512 projection has independent low-rank direction and
+per-output magnitude parameters. Swin and MAN share the existing rank/alpha
+arguments; at rank 4 the MAN adds 46,080 parameters per branch.
+
+Swin and MAN switch routes together. During the DoRA stage, only their DoRA
+branches are optimized; during DoRA1, only their DoRA1 branches are optimized.
+Both branches use the same raw baseline weights and are never chained or
+evaluated together. MAN's packed nine-projection weight is composed once per
+attention forward and reused for its nine slices.
+
+The training and evaluation entrypoints strictly load new checkpoints and
+also accept old Swin-only checkpoints. Missing MAN adapters are initialized
+from the checkpoint's MAN weights with zero direction updates, preserving
+the old output before further training. Such adapters have not been trained:
+to learn both MAN branches, start the DoRA stage from a baseline, then train
+DoRA1 from the resulting new DoRA checkpoint. Starting DoRA1 from an old
+Swin-only checkpoint trains only MAN DoRA1 and leaves MAN DoRA at baseline.
+Old adapter-stage `.tar` optimizer states cannot be resumed with the expanded
+parameter set; use their weights via `--baseline-checkpoint` (baseline stage
+checkpoint) or `--dora-checkpoint` (DoRA stage checkpoint) to start a new stage.
+New `.tar` checkpoints support normal `--resume` including the MAN optimizer
+state. Incomplete MAN adapter checkpoints are rejected rather than filled in.
 
 ```bash
 python train.py

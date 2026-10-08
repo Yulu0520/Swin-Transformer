@@ -11,6 +11,9 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
+from .man_dora import (
+    DualMANDoRAAdapter, add_man_dual_dora, upgrade_man_state_dict,
+)
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -149,12 +152,15 @@ class SwinTransMultiBatch(nn.Module):
             self, dora_rank=4, dora_alpha=4.0,
             dora1_rank=4, dora1_alpha=4.0,
             active_route='dora1', trainable_route=None):
-        """Attach mutually exclusive DoRA/DoRA1 branches to backbone Q/V."""
+        """Attach exclusive branches to Swin Q/V and MAN's four Q + V."""
         count = add_swin_qv_dual_dora(
             self.backbone_features,
             dora_rank, dora_alpha, dora1_rank, dora1_alpha,
             active_route=active_route,
         )
+        add_man_dual_dora(
+            self.encoder, dora_rank, dora_alpha, dora1_rank, dora1_alpha,
+            active_route)
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         if trainable_route is not None:
@@ -162,16 +168,24 @@ class SwinTransMultiBatch(nn.Module):
                     or trainable_route not in ('dora', 'dora1')):
                 raise ValueError(
                     'trainable route must match active DoRA/DoRA1 route')
-            for module in self.backbone_features.modules():
-                if isinstance(module, DualQVDoRAAdapter):
+            for module in self.modules():
+                if isinstance(module, (DualQVDoRAAdapter, DualMANDoRAAdapter)):
                     branch = getattr(module, trainable_route)
                     for parameter in branch.parameters():
                         parameter.requires_grad_(True)
         return count
 
     def set_adapter_route(self, route):
-        """Select baseline, DoRA, or DoRA1 for every Swin Q/V projection."""
-        return set_swin_adapter_route(self.backbone_features, route)
+        """Switch Swin and MAN together; evaluate only the selected branch."""
+        count = set_swin_adapter_route(self.backbone_features, route)
+        for module in self.encoder.modules():
+            if isinstance(module, DualMANDoRAAdapter):
+                module.set_route(route)
+        return count
+
+    def load_compatible_state_dict(self, state):
+        """Load strictly, initializing MAN adapters for Swin-only checkpoints."""
+        return self.load_state_dict(upgrade_man_state_dict(self, state))
 
 
 def swin_t_trans(pretrained=True, pretrained_path=None):

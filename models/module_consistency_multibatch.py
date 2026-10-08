@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import Parameter
+from torch.nn.utils import parametrize
 import torch.nn.functional as F
 
 class LearnableGlobalLocalMultiheadAttention(nn.Module):
@@ -103,6 +104,7 @@ class LearnableGlobalLocalMultiheadAttention(nn.Module):
         local_mask = fw_mask + bw_mask
         return local_mask
 
+    @parametrize.cached()
     def forward(self, query, key, shape, value):
 
         tgt_len, bsz, embed_dim = query.size()

@@ -8,6 +8,7 @@ import os
 
 import numpy as np
 import torch
+from losses.clip_guidance import TEXT_ALIGNMENT_TARGET
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -164,8 +165,13 @@ def build_dual_dora_model(args, checkpoint_path):
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
                 '{} model name does not match --model-name'.format(checkpoint_path))
-        if checkpoint.get('stage') != 'dora1':
-            raise ValueError('{} is not a DoRA1-stage checkpoint'.format(
+        direction_config = checkpoint.get('clip_config') or {}
+        night_day_stage = (checkpoint.get('stage') == 'dora' and
+                           (direction_config.get('direction_source') ==
+                            'day_dora1_minus_night_dora_v1' or
+                            direction_config.get('alignment_target') == TEXT_ALIGNMENT_TARGET))
+        if checkpoint.get('stage') != 'dora1' and not night_day_stage:
+            raise ValueError('{} is not a DoRA1 or night-to-day dual checkpoint'.format(
                 checkpoint_path))
         if checkpoint.get('adapter_type') != 'parallel_dora_dora1':
             raise ValueError('{} is not a DoRA+DoRA1 checkpoint'.format(

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from utils.regression_trainer_cosine_multibatch import RegTrainer
+from losses.clip_guidance import DEFAULT_NIGHT_PROMPT, DEFAULT_DAY_PROMPT
 
 
 def parse_args():
@@ -19,24 +20,26 @@ def parse_args():
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='dora1',
+        default='all',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
+    parser.add_argument('--dual-checkpoint', default='',
+                        help='trained DoRA+DoRA1 weights for stage dora; freeze day DoRA1 and continue night DoRA')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
                         help='official ImageNet-22K Swin-L checkpoint; also works with 256 crops')
@@ -92,10 +95,49 @@ def parse_args():
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
     parser.add_argument('--background-ratio', type=float, default=0.15)
+    parser.add_argument('--clip-model', default='ViT-B/32')
+    parser.add_argument('--clip-cache-dir', default='pre_models/clip')
+    parser.add_argument('--clip-projection-checkpoint', default='')
+    parser.add_argument('--clip-stages', nargs='+', choices=['dora', 'dora1'],
+                        default=['dora', 'dora1'])
+    parser.add_argument('--clip-pair-root', default='',
+                        help='matching day training images; never validation images')
+    parser.add_argument('--clip-pair-prefix', default='night_',
+                        help='prefix removed from source filenames to find day pairs')
+    parser.add_argument('--clip-pair-weight', type=float, default=0.0,
+                        help='obsolete image-teacher loss; must remain zero')
+    parser.add_argument('--clip-align-weight', type=float, default=0.0,
+                        help='two-centre day/night text alignment loss')
+    parser.add_argument('--clip-temperature', type=float, default=0.07)
+    parser.add_argument('--clip-direction-weight', type=float, default=0.0)
+    parser.add_argument('--clip-warmup-epochs', type=int, default=5,
+                        help='start CLIP weights at zero and ramp to full weight')
+    parser.add_argument('--clip-negative-prompt', default=DEFAULT_NIGHT_PROMPT)
+    parser.add_argument('--clip-positive-prompt', default=DEFAULT_DAY_PROMPT)
     
     args = parser.parse_args()
-    if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
-        parser.error('--stage dora needs --baseline-checkpoint or --resume')
+    if args.clip_pair_weight != 0:
+        parser.error('Image-teacher loss was replaced; use --clip-align-weight and keep --clip-pair-weight 0')
+    if (not np.isfinite(args.clip_align_weight) or
+            not np.isfinite(args.clip_direction_weight) or
+            min(args.clip_align_weight, args.clip_direction_weight) < 0 or
+            args.clip_warmup_epochs < 0):
+        parser.error('CLIP weights must be finite and nonnegative; warmup must be nonnegative')
+    if not np.isfinite(args.clip_temperature) or args.clip_temperature <= 0:
+        parser.error('CLIP temperature must be finite and positive')
+    if args.is_gray and (args.clip_align_weight or args.clip_direction_weight):
+        parser.error('CLIP guidance requires RGB input; remove --is-gray')
+    if args.dual_checkpoint and args.stage != 'dora':
+        parser.error('--dual-checkpoint is supported with --stage dora')
+    if args.dual_checkpoint and args.baseline_checkpoint:
+        parser.error('Choose --dual-checkpoint or --baseline-checkpoint')
+    if args.clip_direction_weight or args.clip_align_weight:
+        if args.stage != 'dora' or 'dora' not in args.clip_stages:
+            parser.error('Night-to-day text guidance requires --stage dora and --clip-stages dora')
+        if not args.clip_pair_root or not (args.dual_checkpoint or args.resume):
+            parser.error('Night-to-day text guidance needs --clip-pair-root and --dual-checkpoint (or --resume)')
+    if args.stage == 'dora' and not (args.baseline_checkpoint or args.dual_checkpoint or args.resume):
+        parser.error('--stage dora needs --baseline-checkpoint, --dual-checkpoint or --resume')
     if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):
         parser.error('--stage dora1 needs --dora-checkpoint or --resume')
     if args.stage in ('both', 'all') and args.dora_checkpoint:

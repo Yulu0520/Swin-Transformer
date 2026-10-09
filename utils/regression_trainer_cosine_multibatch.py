@@ -23,6 +23,12 @@ from models.swin_dual_dora import (
 from datasets.crowd import Crowd
 from losses.bay_loss import Bay_Loss
 from losses.post_prob import Post_Prob
+from losses.clip_guidance import (
+    CLIPTeacher, text_alignment_loss, directional_loss, warmup_factor, rgb_to_imagenet,
+    TEXT_ALIGNMENT_TARGET,
+)
+from models.clip_projection import backbone_signature, branch_signature, restore_projection
+from utils.clip_model_loading import load_trained_dual
 from math import ceil
 import random
 
@@ -51,13 +57,40 @@ def train_collate(batch):
     points = transposed_batch[1]  # the number of points is not fixed, keep it as a list of tensor
     targets = transposed_batch[2]
     st_sizes = torch.FloatTensor(transposed_batch[3])
-    return images, points, targets, st_sizes
+    result = (images, points, targets, st_sizes)
+    if len(transposed_batch) == 5:
+        return result + (torch.stack(transposed_batch[4], 0),)
+    return result
+
+
+def clip_config(args):
+    if (args.stage not in getattr(args, 'clip_stages', []) or
+            not (getattr(args, 'clip_align_weight', 0) or
+                 getattr(args, 'clip_direction_weight', 0))):
+        return None
+    names = ('clip_model', 'clip_pair_root', 'clip_pair_prefix',
+             'clip_align_weight', 'clip_temperature', 'clip_direction_weight', 'clip_warmup_epochs',
+             'clip_negative_prompt', 'clip_positive_prompt')
+    config = {name: getattr(args, name) for name in names}
+    config['alignment_target'] = TEXT_ALIGNMENT_TARGET
+    if args.clip_direction_weight:
+        config['direction_source'] = 'day_dora1_minus_night_dora_v1'
+    return config
 
 
 class RegTrainer(Trainer):
     def setup(self):
         """initial the datasets, model, loss and optimizer"""
         args = self.args
+        self.clip_config = clip_config(args)
+        self.clip_teacher = None
+        self.clip_projection = None
+        self.clip_projection_checkpoint = None
+        if self.clip_config and not args.clip_pair_root:
+            raise ValueError('CLIP guidance requires synchronized day pairs via --clip-pair-root')
+        if self.clip_config:
+            if args.stage != 'dora' or not (getattr(args, 'dual_checkpoint', '') or args.resume):
+                raise ValueError('Night-to-day guidance trains stage dora from a trained dual checkpoint')
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.device_count = torch.cuda.device_count()
@@ -83,10 +116,23 @@ class RegTrainer(Trainer):
             },
         }
         active_roots = data_roots[args.stage]
+        # Keep identical paired preprocessing in zero-weight control runs.
+        paired_data = (args.stage != 'baseline' and
+                       bool(getattr(args, 'clip_pair_root', '')))
         self.datasets = {x: Crowd(active_roots[x],
                                   args.crop_size,
                                   args.downsample_ratio,
-                                  args.is_gray, x) for x in ['train', 'val']}
+                                  args.is_gray, x,
+                                  pair_root=(args.clip_pair_root if
+                                      x == 'train' and paired_data else None),
+                                  pair_prefix=getattr(args, 'clip_pair_prefix', 'night_'),
+                                  disable_gray=bool(self.clip_config) or paired_data)
+                         for x in ['train', 'val']}
+        if self.clip_config:
+            prefix = args.clip_pair_prefix
+            if not prefix or any(not os.path.basename(path).startswith(prefix)
+                                 for path in self.datasets['train'].im_list):
+                raise ValueError('Text-guided stage dora requires night-prefixed training images')
         for split in ['train', 'val']:
             if not self.datasets[split].im_list:
                 raise ValueError('No .jpg images in {}'.format(active_roots[split]))
@@ -113,20 +159,29 @@ class RegTrainer(Trainer):
                           and not args.resume)
         self.model = model_builder(pretrained=use_pretrained,
                                    pretrained_path=args.pretrained_path)
+        self.initial_night_signature = None
         if args.stage == 'dora':
-            if not args.resume:
-                checkpoint = load_checkpoint(args.baseline_checkpoint)
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    if checkpoint.get('stage', 'baseline') != 'baseline':
-                        raise ValueError('DoRA needs a baseline checkpoint')
-                    if checkpoint.get('model_name', args.model_name) != args.model_name:
-                        raise ValueError('Baseline checkpoint model name does not match')
-                state = checkpoint.get('model_state_dict', checkpoint)
-                self.model.load_state_dict(state)
-            count = self.model.enable_dual_dora(
-                args.dora_rank, args.dora_alpha,
-                args.dora1_rank, args.dora1_alpha,
-                active_route='dora', trainable_route='dora')
+            if not args.resume and getattr(args, 'dual_checkpoint', ''):
+                checkpoint = load_checkpoint(args.dual_checkpoint)
+                count = load_trained_dual(
+                    self.model, checkpoint, args.model_name,
+                    args.dora_rank, args.dora_alpha, args.dora1_rank, args.dora1_alpha,
+                    active_route='dora', trainable_route='dora')
+                self.initial_night_signature = branch_signature(self.model, 'dora')
+            else:
+                if not args.resume:
+                    checkpoint = load_checkpoint(args.baseline_checkpoint)
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        if checkpoint.get('stage', 'baseline') != 'baseline':
+                            raise ValueError('DoRA needs a baseline checkpoint')
+                        if checkpoint.get('model_name', args.model_name) != args.model_name:
+                            raise ValueError('Baseline checkpoint model name does not match')
+                    state = checkpoint.get('model_state_dict', checkpoint)
+                    self.model.load_state_dict(state)
+                count = self.model.enable_dual_dora(
+                    args.dora_rank, args.dora_alpha,
+                    args.dora1_rank, args.dora1_alpha,
+                    active_route='dora', trainable_route='dora')
             logging.info(
                 'Dual DoRA added to %d Swin blocks; only DoRA is active',
                 count)
@@ -233,6 +288,38 @@ class RegTrainer(Trainer):
                                    args.background_ratio,
                                    args.use_background,
                                    self.device)
+        if args.resume and args.resume.endswith('.tar'):
+            if resumed_state.get('clip_config') != self.clip_config:
+                raise ValueError('Resume CLIP configuration differs; use the same CLIP arguments')
+        if self.clip_config:
+            projection_state = resumed_state.get('clip_projection_checkpoint')
+            if projection_state is None:
+                if not args.clip_projection_checkpoint:
+                    raise ValueError('CLIP guidance requires --clip-projection-checkpoint')
+                projection_state = load_checkpoint(args.clip_projection_checkpoint)
+            if projection_state.get('alignment_target') != TEXT_ALIGNMENT_TARGET:
+                raise ValueError('Recalibrate the adapter using day/night crowd text centres')
+            if not torch.is_tensor(projection_state.get('text_centres')):
+                raise ValueError('Projection checkpoint is missing cached text centres')
+            self.clip_teacher = CLIPTeacher(
+                args.clip_model, self.device, args.clip_cache_dir,
+                args.clip_negative_prompt, args.clip_positive_prompt,
+                cached_centres=projection_state.get('text_centres'))
+            # Teacher remains fixed on resume; the student is checked against
+            # its calibration weights only at a fresh start.
+            branch_checks = dict(
+                day_signature=branch_signature(self.model, 'dora1'),
+                night_signature=(branch_signature(self.model, 'dora')
+                                 if args.resume.endswith('.pth')
+                                 else self.initial_night_signature))
+            self.clip_projection, self.clip_projection_checkpoint = restore_projection(
+                projection_state, args.model_name, args.clip_model,
+                self.model.backbone_channels, self.clip_teacher.embedding_dim,
+                backbone_signature(self.model), **branch_checks,
+                text_prompts=dict(day_prompt=args.clip_positive_prompt,
+                                  night_prompt=args.clip_negative_prompt))
+            self.clip_projection.to(self.device)
+            logging.info('CLIP guidance enabled: %s', self.clip_config)
         self.criterion = Bay_Loss(args.use_background, self.device)
         # self.criterion = torch.nn.MSELoss(reduction='sum')
         self.save_list = Save_Handle(max_num=args.max_model_num)
@@ -277,6 +364,8 @@ class RegTrainer(Trainer):
         epoch_loss = AverageMeter()
         epoch_bayesian_loss = AverageMeter()
         epoch_consistency_loss = AverageMeter()
+        epoch_clip_alignment_loss = AverageMeter()
+        epoch_clip_direction_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
@@ -292,7 +381,10 @@ class RegTrainer(Trainer):
             dynamic_ncols=True,
             mininterval=0.5,
         )
-        for step, (inputs, points, targets, st_sizes) in train_bar:
+        clip_scale = (warmup_factor(self.epoch_index, self.args.clip_warmup_epochs)
+                      if self.clip_config else 0.0)
+        for step, batch in train_bar:
+            inputs, points, targets, st_sizes = batch[:4]
             inputs = inputs.to(self.device)
             st_sizes = st_sizes.to(self.device)
             gd_count = np.array([len(p) for p in points], dtype=np.float32)
@@ -300,7 +392,34 @@ class RegTrainer(Trainer):
             targets = [t.to(self.device) for t in targets]
 
             with torch.set_grad_enabled(True):
-                outputs, features = self.model(inputs)
+                clip_alignment_loss = inputs.new_zeros(())
+                clip_direction_loss = inputs.new_zeros(())
+                if self.clip_config and clip_scale > 0:
+                    day_z = None
+                    if self.args.clip_direction_weight:
+                        # Day reference uses the trained frozen DoRA1 branch;
+                        # both domains pass through the same calibrated P.
+                        self.model.set_adapter_route('dora1')
+                        try:
+                            with torch.no_grad():
+                                day_inputs = rgb_to_imagenet(batch[4].to(self.device))
+                                day_z = self.clip_projection(
+                                    self.model.extract_backbone_features(day_inputs))
+                        finally:
+                            self.model.set_adapter_route(self.args.stage)
+                    outputs, features, backbone_features = self.model(
+                        inputs, return_backbone_features=True)
+                    adapted_z = self.clip_projection(backbone_features)
+                    if self.args.clip_align_weight:
+                        night_labels = torch.ones(inputs.size(0), device=inputs.device, dtype=torch.long)
+                        clip_alignment_loss = text_alignment_loss(
+                            adapted_z, self.clip_teacher.text_centres, night_labels,
+                            self.args.clip_temperature)
+                    if self.args.clip_direction_weight:
+                        clip_direction_loss = directional_loss(
+                            adapted_z, day_z, self.clip_teacher.text_direction)
+                else:
+                    outputs, features = self.model(inputs)
                 prob_list = self.post_prob(points, st_sizes)
                 bayesian_loss = self.criterion(prob_list, targets, outputs)
                 loss_c = outputs.new_zeros(())
@@ -314,6 +433,10 @@ class RegTrainer(Trainer):
                     )
                     loss_c += cosine.sum(dim=1).mean()
                 loss = bayesian_loss + loss_c
+                if self.clip_config:
+                    loss = loss + clip_scale * (
+                        self.args.clip_align_weight * clip_alignment_loss +
+                        self.args.clip_direction_weight * clip_direction_loss)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -325,10 +448,19 @@ class RegTrainer(Trainer):
                 epoch_loss.update(loss.item(), N)
                 epoch_bayesian_loss.update(bayesian_loss.item(), N)
                 epoch_consistency_loss.update(loss_c.item(), N)
+                epoch_clip_alignment_loss.update(clip_alignment_loss.item(), N)
+                epoch_clip_direction_loss.update(clip_direction_loss.item(), N)
                 epoch_mse.update(np.mean(res * res), N)
                 epoch_mae.update(np.mean(abs(res)), N)
 
                 if self.global_step % self.args.tensorboard_log_interval == 0:
+                    if self.clip_config:
+                        self.writer.add_scalar('train_step/clip_alignment_loss',
+                                               clip_alignment_loss.item(), self.global_step)
+                        self.writer.add_scalar('train_step/clip_direction_loss',
+                                               clip_direction_loss.item(), self.global_step)
+                        self.writer.add_scalar('train_step/clip_scale',
+                                               clip_scale, self.global_step)
                     self.writer.add_scalar(
                         'train_step/total_loss', loss.item(), self.global_step
                     )
@@ -354,6 +486,10 @@ class RegTrainer(Trainer):
                         loss.item(), bayesian_loss.item(), loss_c.item(),
                         extra={'file_only': True},
                     )
+                    if self.clip_config:
+                        logging.info('CLIP text_alignment=%.4f direction=%.4f scale=%.3f',
+                                     clip_alignment_loss.item(), clip_direction_loss.item(),
+                                     clip_scale, extra={'file_only': True})
 
                 train_bar.set_postfix_str(
                     'loss={:.3f}'.format(loss.item()),
@@ -362,6 +498,11 @@ class RegTrainer(Trainer):
                 self.global_step += 1
 
         train_rmse = np.sqrt(epoch_mse.get_avg())
+        if self.clip_config:
+            self.writer.add_scalar('train/clip_alignment_loss', epoch_clip_alignment_loss.get_avg(), self.epoch)
+            self.writer.add_scalar('train/clip_direction_loss',
+                                   epoch_clip_direction_loss.get_avg(), self.epoch)
+            self.writer.add_scalar('train/clip_scale', clip_scale, self.epoch)
         self.writer.add_scalar('train/total_loss', epoch_loss.get_avg(), self.epoch)
         self.writer.add_scalar(
             'train/bayesian_loss', epoch_bayesian_loss.get_avg(), self.epoch
@@ -419,7 +560,10 @@ class RegTrainer(Trainer):
             'best_model_path': self.best_model_path,
             'best_count': self.best_count,
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'model_state_dict': model_state_dic
+            'model_state_dict': model_state_dic,
+            'clip_config': self.clip_config,
+            'clip_projection_checkpoint': self.clip_projection_checkpoint,
+            'parent_dual_checkpoint': getattr(self.args, 'dual_checkpoint', ''),
         }, save_path)
         self.save_list.append(save_path)  # control the number of saved models
 

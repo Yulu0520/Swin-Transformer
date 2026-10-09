@@ -88,6 +88,7 @@ class SwinTransMultiBatch(nn.Module):
         else:
             raise ValueError('Unknown Swin variant: {}'.format(variant))
         self.variant = variant
+        self.backbone_channels = output_channels
         self.backbone_features = backbone.features
         self.backbone_norm = backbone.norm
 
@@ -116,14 +117,18 @@ class SwinTransMultiBatch(nn.Module):
             nn.Conv2d(128, 1, kernel_size=1),
         )
 
-    def forward(self, x):
+    def extract_backbone_features(self, x):
+        """Channels-first Swin features before the MAN channel adapter."""
+        x = self.backbone_norm(self.backbone_features(x))
+        return x.permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, x, return_backbone_features=False):
         input_h, input_w = x.shape[-2:]
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
-        x = self.backbone_norm(x)
-        x = x.permute(0, 3, 1, 2).contiguous()
+        backbone_features = self.extract_backbone_features(x)
+        x = backbone_features
         x = self.feature_adapter(x)
 
         batch_size, channels, height, width = x.shape
@@ -137,7 +142,10 @@ class SwinTransMultiBatch(nn.Module):
             x, size=density_size, mode="bilinear", align_corners=False
         )
         density = self.reg_layer_0(x)
-        return torch.relu(density), consistency_features
+        result = (torch.relu(density), consistency_features)
+        if return_backbone_features:
+            return result + (backbone_features,)
+        return result
 
     def enable_dora(self, rank=4, alpha=4.0):
         """Freeze the clean baseline and adapt all backbone attention Q/V."""

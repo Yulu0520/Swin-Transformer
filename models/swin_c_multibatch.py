@@ -10,7 +10,7 @@ from .transformer_cosine_multibatch import (
     TransformerEncoder,
     TransformerEncoderLayer,
 )
-from .swin_dora import add_swin_qv_dora
+from .swin_dora import add_swin_dora
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -139,21 +139,22 @@ class SwinTransMultiBatch(nn.Module):
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 
-    def enable_dora(self, rank=4, alpha=4.0):
-        """Freeze the clean baseline and adapt all backbone attention Q/V."""
+    def enable_dora(self, rank=4, alpha=4.0, targets='qv'):
+        """Freeze the baseline and adapt selected backbone attention projections."""
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        return add_swin_qv_dora(self.backbone_features, rank, alpha)
+        return add_swin_dora(self.backbone_features, rank, alpha, targets)
 
     def enable_dual_dora(
             self, dora_rank=4, dora_alpha=4.0,
             dora1_rank=4, dora1_alpha=4.0,
-            active_route='dora1', trainable_route=None):
-        """Attach mutually exclusive DoRA/DoRA1 branches to backbone Q/V."""
+            active_route='dora1', trainable_route=None, targets='qv',
+            dora1_targets='qv'):
+        """Attach independent, mutually exclusive DoRA/DoRA1 projections."""
         count = add_swin_qv_dual_dora(
             self.backbone_features,
             dora_rank, dora_alpha, dora1_rank, dora1_alpha,
-            active_route=active_route,
+            active_route=active_route, targets=targets, dora1_targets=dora1_targets,
         )
         for parameter in self.parameters():
             parameter.requires_grad_(False)
@@ -170,7 +171,7 @@ class SwinTransMultiBatch(nn.Module):
         return count
 
     def set_adapter_route(self, route):
-        """Select baseline, DoRA, or DoRA1 for every Swin Q/V projection."""
+        """Select baseline, DoRA, or DoRA1 for every adapted Swin projection."""
         return set_swin_adapter_route(self.backbone_features, route)
 
 

@@ -12,6 +12,8 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from utils.checkpoint import load_checkpoint
+
 from datasets.crowd import Crowd
 from datasets.day_night import build_router_transform
 from models import swin_c_multibatch as models
@@ -20,6 +22,8 @@ from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
 )
+
+from models.swin_dora import DORA_TARGETS
 
 
 def parse_args():
@@ -58,6 +62,10 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--crop-size', type=int, default=384)
     parser.add_argument('--downsample-ratio', type=int, default=16)
+    parser.add_argument('--dora-targets', type=str.lower, choices=DORA_TARGETS,
+                        default='qv', help='DoRA projections in all Swin blocks; shared rank/alpha')
+    parser.add_argument('--dora1-targets', type=str.lower, choices=DORA_TARGETS,
+                        default='qv', help='independent DoRA1 projections; shared DoRA1 rank/alpha')
     parser.add_argument('--dora-rank', type=int, default=4,
                         help='required when the DoRA checkpoint is a .pth file')
     parser.add_argument('--dora-alpha', type=float, default=4.0,
@@ -67,13 +75,6 @@ def parse_args():
     parser.add_argument('--dora1-alpha', type=float, default=4.0,
                         help='must match training for a dual .pth checkpoint')
     return parser.parse_args()
-
-
-def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
 
 
 def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
@@ -106,6 +107,8 @@ def build_model(args, checkpoint_path, expect_dora):
         if (expect_dora and checkpoint.get('adapter_type', 'dora') not in
                 ('dora', 'parallel_dora_dora1', 'parallel_dora_lora')):
             raise ValueError('{} is not a DoRA checkpoint'.format(checkpoint_path))
+        targets = checkpoint.get('dora_targets', 'qv')
+        targets1 = checkpoint.get('dora1_targets', 'qv')
         state = checkpoint['model_state_dict']
         rank = checkpoint.get('dora_rank', 0)
         alpha = checkpoint.get('dora_alpha', args.dora_alpha)
@@ -113,18 +116,15 @@ def build_model(args, checkpoint_path, expect_dora):
         dora1_alpha = checkpoint.get('dora1_alpha', args.dora1_alpha)
     else:
         state = checkpoint
+        targets = args.dora_targets
+        targets1 = args.dora1_targets
         rank = args.dora_rank if expect_dora else 0
         alpha = args.dora_alpha
         dora1_rank, dora1_alpha = args.dora1_rank, args.dora1_alpha
 
-    dora_markers = (
-        'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
-        'magnitude_q', 'magnitude_v',
-    )
     contains_parametrization = any(
         '.parametrizations.weight.' in key for key in state)
-    contains_dora = all(
-        any(marker in key for key in state) for marker in dora_markers)
+    contains_dora = any('dora_A_' in key for key in state)
     contains_parallel = (
         any('.parametrizations.weight.0.dora.' in key for key in state)
         and any('.parametrizations.weight.0.dora1.' in key for key in state)
@@ -147,9 +147,10 @@ def build_model(args, checkpoint_path, expect_dora):
     if expect_dora:
         if contains_parallel:
             model.enable_dual_dora(
-                rank, alpha, dora1_rank, dora1_alpha, active_route='dora')
+                rank, alpha, dora1_rank, dora1_alpha, active_route='dora', targets=targets,
+                dora1_targets=targets1)
         else:
-            model.enable_dora(rank, alpha)
+            model.enable_dora(rank, alpha, targets=targets)
             if contains_legacy_parallel:
                 state = extract_dora_from_legacy_state(state)
     model.load_state_dict(state)
@@ -170,6 +171,8 @@ def build_dual_dora_model(args, checkpoint_path):
         if checkpoint.get('adapter_type') != 'parallel_dora_dora1':
             raise ValueError('{} is not a DoRA+DoRA1 checkpoint'.format(
                 checkpoint_path))
+        targets = checkpoint.get('dora_targets', 'qv')
+        targets1 = checkpoint.get('dora1_targets', 'qv')
         state = checkpoint['model_state_dict']
         dora_rank = checkpoint.get('dora_rank')
         dora_alpha = checkpoint.get('dora_alpha')
@@ -177,17 +180,13 @@ def build_dual_dora_model(args, checkpoint_path):
         dora1_alpha = checkpoint.get('dora1_alpha')
     else:
         state = checkpoint
+        targets = args.dora_targets
+        targets1 = args.dora1_targets
         dora_rank, dora_alpha = args.dora_rank, args.dora_alpha
         dora1_rank, dora1_alpha = args.dora1_rank, args.dora1_alpha
 
-    dora_markers = (
-        'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
-        'magnitude_q', 'magnitude_v',
-    )
-    has_dora = all(any('.dora.{}'.format(marker) in key for key in state)
-                   for marker in dora_markers)
-    has_dora1 = all(any('.dora1.{}'.format(marker) in key for key in state)
-                    for marker in dora_markers)
+    has_dora = any('.dora.dora_A_' in key for key in state)
+    has_dora1 = any('.dora1.dora_A_' in key for key in state)
     if not has_dora or not has_dora1:
         raise ValueError('{} does not contain complete DoRA+DoRA1 adapters'.format(
             checkpoint_path))
@@ -197,7 +196,7 @@ def build_dual_dora_model(args, checkpoint_path):
     model = getattr(models, args.model_name)(pretrained=False)
     model.enable_dual_dora(
         dora_rank, dora_alpha, dora1_rank, dora1_alpha,
-        active_route=args.dual_route)
+        active_route=args.dual_route, targets=targets, dora1_targets=targets1)
     model.load_state_dict(state)
     model.set_adapter_route(args.dual_route)
     return model

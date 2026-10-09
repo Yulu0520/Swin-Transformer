@@ -1,11 +1,11 @@
-"""Mutually exclusive dual-DoRA routing for packed Swin QKV weights."""
+"""Mutually exclusive dual-DoRA routing for Swin attention projections."""
 
 import math
 
 from torch import nn
 from torch.nn.utils import parametrize
 
-from .swin_dora import QVDoRA
+from .swin_dora import ProjectionDoRA, validate_dora_targets
 
 
 LEGACY_DORA_PREFIX = '.parametrizations.weight.0.dora.'
@@ -37,17 +37,39 @@ def extract_dora_from_legacy_state(state):
     return converted
 
 
+def extract_dora_from_dual_state(state):
+    """Keep trained DoRA and baseline, dropping the inactive DoRA1 branch.
+
+    A projection used only by DoRA1 is restored to an ordinary Linear weight.
+    This permits starting a fresh DoRA1 with different targets and rank/alpha.
+    """
+    prefix = '.parametrizations.weight.0.dora.'
+    adapted_layers = {key.split(prefix)[0] for key in state
+                      if prefix + 'dora_A_' in key}
+    converted = state.__class__()
+    original_suffix = '.parametrizations.weight.original'
+    for key, value in state.items():
+        if '.parametrizations.weight.0.dora1.' in key:
+            continue
+        if key.endswith(original_suffix):
+            layer = key[:-len(original_suffix)]
+            if layer not in adapted_layers:
+                key = layer + '.weight'
+        converted[key.replace(prefix, '.parametrizations.weight.0.')] = value
+    return converted
+
+
 class DualQVDoRAAdapter(nn.Module):
-    """Route one baseline QKV weight through one of two DoRA branches."""
+    """Route one baseline projection through one of two DoRA branches."""
 
     ROUTES = ('baseline', 'dora', 'dora1')
 
     def __init__(self, dora, dora1, active_route='dora1'):
         super().__init__()
-        if not isinstance(dora, QVDoRA):
-            raise TypeError('dora must be a QVDoRA module')
-        if not isinstance(dora1, QVDoRA):
-            raise TypeError('dora1 must be a QVDoRA module')
+        if not isinstance(dora, ProjectionDoRA):
+            raise TypeError('dora must be a ProjectionDoRA module')
+        if not isinstance(dora1, ProjectionDoRA):
+            raise TypeError('dora1 must be a ProjectionDoRA module')
         self.dora = dora
         self.dora1 = dora1
         self.set_route(active_route)
@@ -81,54 +103,62 @@ def _swin_qkv_layers(features):
     return qkv_layers
 
 
-def _validate_existing_dora(dora, rank, alpha):
-    actual_rank = dora.dora_A_q.shape[0]
-    if actual_rank != rank or not math.isclose(
+def _validate_existing_dora(dora, rank, alpha, targets):
+    if dora.targets != targets or dora.rank != rank or not math.isclose(
             dora.scaling, alpha / rank, rel_tol=1e-9, abs_tol=0.0):
-        raise ValueError('Existing DoRA settings do not match requested rank/alpha')
+        raise ValueError('Existing DoRA settings do not match requested targets/rank/alpha')
 
 
 def add_swin_qv_dual_dora(
         features, dora_rank, dora_alpha, dora1_rank, dora1_alpha,
-        active_route='dora1'):
-    """Attach parallel DoRA and DoRA1 branches to every Swin Q/V block.
+        active_route='dora1', targets='qv', dora1_targets='qv'):
+    """Attach parallel branches to selected projections in every Swin block.
 
     If a standalone DoRA is already attached, it is preserved. Both branches
     always receive the same raw baseline weight rather than another adapter's
     output.
     """
+    targets = validate_dora_targets(targets)
+    dora1_targets = validate_dora_targets(dora1_targets)
     qkv_layers = _swin_qkv_layers(features)
+    layers = []
     for qkv in qkv_layers:
-        if parametrize.is_parametrized(qkv, 'weight'):
-            parametrizations = qkv.parametrizations.weight
+        selected = ''.join(t for t in 'qkv' if t in targets)
+        selected1 = ''.join(t for t in 'qkv' if t in dora1_targets)
+        if selected or selected1:
+            layers.append((qkv, selected, selected1, True))
+    if 'o' in targets or 'o' in dora1_targets:
+        for module in features.modules():
+            if hasattr(module, 'attn') and hasattr(module.attn, 'qkv'):
+                layers.append((module.attn.proj,
+                               'o' if 'o' in targets else '',
+                               'o' if 'o' in dora1_targets else '', False))
+    for layer, selected, selected1, packed in layers:
+        if parametrize.is_parametrized(layer, 'weight'):
+            parametrizations = layer.parametrizations.weight
             if (len(parametrizations) != 1
-                    or not isinstance(parametrizations[0], QVDoRA)):
+                    or not isinstance(parametrizations[0], ProjectionDoRA)):
                 raise ValueError(
                     'Expected exactly one DoRA parametrization before routing')
             dora = parametrizations[0]
-            _validate_existing_dora(dora, dora_rank, dora_alpha)
+            _validate_existing_dora(dora, dora_rank, dora_alpha, selected)
             parametrize.remove_parametrizations(
-                qkv, 'weight', leave_parametrized=False)
+                layer, 'weight', leave_parametrized=False)
         else:
-            dora = QVDoRA(qkv.weight, dora_rank, dora_alpha)
-
-        dora1 = QVDoRA(qkv.weight, dora1_rank, dora1_alpha)
+            dora = ProjectionDoRA(layer.weight, dora_rank, dora_alpha, selected, packed)
+        dora1 = ProjectionDoRA(layer.weight, dora1_rank, dora1_alpha, selected1, packed)
         router = DualQVDoRAAdapter(dora, dora1, active_route)
-        parametrize.register_parametrization(qkv, 'weight', router)
+        parametrize.register_parametrization(layer, 'weight', router)
     return len(qkv_layers)
 
 
 def set_swin_adapter_route(features, route):
     """Select one branch without evaluating the inactive adapter."""
-    routers = []
-    for qkv in _swin_qkv_layers(features):
-        if not parametrize.is_parametrized(qkv, 'weight'):
-            raise ValueError('Dual DoRA adapters are not attached')
-        parametrizations = qkv.parametrizations.weight
-        if (len(parametrizations) != 1
-                or not isinstance(parametrizations[0], DualQVDoRAAdapter)):
-            raise ValueError('Expected exactly one DualQVDoRAAdapter')
-        routers.append(parametrizations[0])
+    block_count = len(_swin_qkv_layers(features))
+    routers = [module for module in features.modules()
+               if isinstance(module, DualQVDoRAAdapter)]
+    if not routers:
+        raise ValueError('Dual DoRA adapters are not attached')
     for router in routers:
         router.set_route(route)
-    return len(routers)
+    return block_count

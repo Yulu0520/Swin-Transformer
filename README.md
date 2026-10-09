@@ -20,19 +20,73 @@ baseline and trains Q/V DoRA in all 24 Swin attention blocks on
 `SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
 and custom Transformer stay frozen during DoRA training.
 
-DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
-for every Q/V output vector. K remains unchanged. The magnitude is initialized
+With the default `qv` targets, DoRA learns a low-rank Q/V direction update
+and a separate magnitude for every Q/V output vector; K remains unchanged. The magnitude is initialized
 from the clean baseline, so attaching DoRA does not change the model output
 before adaptation starts. The parallel DoRA1 branch is present but frozen
 during this stage and is never called by the DoRA forward route.
 
+### Attention projection ablation
+
+`train.py --dora-targets` selects **q, k, v, o, qk, qv, or qkvo**
+(case insensitive; default: `qv`). Q/K/V are independently adapted slices of
+`attn.qkv`; O is the attention output projection `attn.proj`. Every selected
+projection in every Swin block shares the same `--dora-rank` and
+`--dora-alpha`. Swin-T has 12 blocks. Original model weights, biases, the MAN
+encoder, and density head remain frozen during DoRA training. DoRA1 has an independent `--dora1-targets` selector with the same seven choices
+(default: `qv`), plus its own `--dora1-rank` and `--dora1-alpha`. The two
+branches need not select the same projections or use the same rank/alpha.
+Each branch applies its settings uniformly across its selected projections.
+Only the active branch is evaluated or trained.
+
+```bash
+python train.py --model-name swin_t_trans --stage dora \
+  --baseline-checkpoint /path/to/baseline/best_model.pth \
+  --dora-targets qkvo --dora-rank 8 --dora-alpha 16
+```
+
+To train DoRA1 independently from an existing DoRA checkpoint:
+
+```bash
+python train.py --model-name swin_t_trans --stage dora1 \
+  --dora-checkpoint /path/to/dora/best_model.pth \
+  --dora-targets qv --dora-rank 4 --dora-alpha 4 \
+  --dora1-targets qkvo --dora1-rank 8 --dora1-alpha 16
+```
+
+DoRA settings must match the trained checkpoint. Starting DoRA1 initializes a
+fresh branch from the frozen baseline, so its targets and rank/alpha may differ
+from the inactive DoRA1 stored in a DoRA-stage checkpoint. Resuming an existing
+DoRA1 run instead requires both branches' settings to match. Evaluation reads
+both target selectors from metadata; for older `.pth` files without metadata,
+supply both selectors explicitly (`qv` for historical Q/V branches).
+
+For the seven ablations, change only `--dora-targets`; use the same baseline,
+rank/alpha, data, seed, and training budget for every configuration. The number
+of trainable parameters is logged alongside the selected targets.
+
+Epoch `.tar` checkpoints store adapter settings. Newly saved best `.pth`
+weights retain the existing state-dict format and have a companion
+`best_model.pth.json` containing settings. Keep both files together: training
+and evaluation automatically read this metadata, and resume validates the
+adapter settings. Resuming `.pth` starts with a fresh optimizer; `.tar` resumes
+optimizer and epoch state. Older `.pth` files without metadata require matching
+rank/alpha and targets supplied explicitly (old Q/V checkpoints use `qv`).
+
+```bash
+python test.py --model-name swin_t_trans --router-mode fixed \
+  --baseline-checkpoint /path/to/baseline/best_model.pth \
+  --dora-checkpoint /path/to/dora/best_model.pth --dora1-checkpoint '' \
+  --dora-targets qkvo --dora-rank 8 --dora-alpha 16
+```
+
 The optional third stage trains a second DoRA branch named DoRA1 in parallel
-with the trained DoRA branch. Both branches read the same frozen baseline Q/V
-weight, and exactly one branch is evaluated per forward. During DoRA1 training,
+with the trained DoRA branch. Both branches read the same frozen baseline projection
+weights, and exactly one branch is evaluated per forward. During DoRA1 training,
 the baseline and complete DoRA branch are frozen and DoRA is not called; only
 DoRA1's direction and magnitude parameters are optimized. Both branches start
-from the clean baseline output. K, the MAN encoder, and the density head are
-shared and frozen.
+from the clean baseline output. Original projection weights, the MAN encoder, and the density head are
+shared and frozen. Each branch adapts only its selected projections.
 
 ```bash
 python train.py

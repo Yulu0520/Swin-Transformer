@@ -3,6 +3,7 @@
 import argparse
 import copy
 import gc
+import math
 import os
 import random
 
@@ -10,6 +11,8 @@ import numpy as np
 import torch
 
 from utils.regression_trainer_cosine_multibatch import RegTrainer
+
+from models.swin_dora import DORA_TARGETS
 
 
 def parse_args():
@@ -33,9 +36,9 @@ def parse_args():
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/hybrid-router/model/swin_t_trans/baseline/1006-204247/best_model.pth',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1009-104004/best_model.pth',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -44,6 +47,10 @@ def parse_args():
                         action='store_false')
     
     parser.set_defaults(pretrained_backbone=True)
+    parser.add_argument('--dora-targets', type=str.lower, choices=DORA_TARGETS,
+                        default='qv', help='DoRA projections in all Swin blocks; shared rank/alpha')
+    parser.add_argument('--dora1-targets', type=str.lower, choices=DORA_TARGETS,
+                        default='qkvo', help='independent DoRA1 projections; shared DoRA1 rank/alpha')
     parser.add_argument('--dora-rank', type=int, default=4)
     parser.add_argument('--dora-alpha', type=float, default=4.0)
     parser.add_argument('--dora1-rank', type=int, default=4)
@@ -125,9 +132,9 @@ def parse_args():
                          'to select a best checkpoint'.format(name, name))
     if args.crop_size <= 0 or args.crop_size % args.downsample_ratio:
         parser.error('--crop-size must be positive and divisible by --downsample-ratio')
-    if args.dora_rank <= 0 or args.dora_alpha <= 0:
+    if args.dora_rank <= 0 or args.dora_alpha <= 0 or not math.isfinite(args.dora_alpha):
         parser.error('DoRA rank and alpha must be positive')
-    if args.dora1_rank <= 0 or args.dora1_alpha <= 0:
+    if args.dora1_rank <= 0 or args.dora1_alpha <= 0 or not math.isfinite(args.dora1_alpha):
         parser.error('DoRA1 rank and alpha must be positive')
     return args
 

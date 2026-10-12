@@ -83,6 +83,9 @@ class RegTrainer(Trainer):
             },
         }
         active_roots = data_roots[args.stage]
+        uses_ccst = '_ccst_' in args.model_name
+        if uses_ccst and args.stage == 'baseline' and args.batch_size < 2:
+            raise ValueError('CCST baseline BatchNorm requires batch size >= 2 per device')
         self.datasets = {x: Crowd(active_roots[x],
                                   args.crop_size,
                                   args.downsample_ratio,
@@ -100,6 +103,8 @@ class RegTrainer(Trainer):
                                           batch_size=(args.batch_size
                                           if x == 'train' else 1),
                                           shuffle=(True if x == 'train' else False),
+                                          drop_last=(uses_ccst and args.stage == 'baseline'
+                                                     and x == 'train'),
                                           num_workers=args.num_workers*self.device_count,
                                           pin_memory=(True if x == 'train' else False),
                                           worker_init_fn=seed_worker,

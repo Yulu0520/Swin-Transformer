@@ -14,8 +14,9 @@ from utils.regression_trainer_cosine_multibatch import RegTrainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Swin + MAN')
-    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
-                        default='swin_t_trans',
+    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans',
+                                                'swin_l_ccst_trans', 'swin_t_ccst_trans'],
+                        default='swin_t_ccst_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
@@ -26,16 +27,16 @@ def parse_args():
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_ccst_trans/dora/1010-224535/best_model.pth',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -59,22 +60,22 @@ def parse_args():
                         help='continue the selected stage from its .tar checkpoint')
     
     parser.add_argument('--max-model-num', type=int, default=1)
-    parser.add_argument('--pretrain-epochs', type=int, default=10,
+    parser.add_argument('--pretrain-epochs', type=int, default=600,
                         help='number of clean baseline training epochs')
     parser.add_argument('--pretrain-val-epoch', type=int, default=5,
                         help='validate the baseline every N pretrain epochs')
-    parser.add_argument('--pretrain-val-start', type=int, default=0,
+    parser.add_argument('--pretrain-val-start', type=int, default=200,
                         help='first zero-based pretrain epoch eligible for validation')
     parser.add_argument('--dora-epochs', '--max-epoch', dest='dora_epochs',
-                        type=int, default=10,
+                        type=int, default=1200,
                         help='number of DoRA training epochs')
     parser.add_argument('--dora-val-epoch', '--val-epoch', dest='dora_val_epoch',
                         type=int, default=5,
                         help='validate DoRA every N DoRA training epochs')
     parser.add_argument('--dora-val-start', '--val-start', dest='dora_val_start',
-                        type=int, default=0,
+                        type=int, default=200,
                         help='first zero-based DoRA epoch eligible for validation')
-    parser.add_argument('--dora1-epochs', type=int, default=10,
+    parser.add_argument('--dora1-epochs', type=int, default=1200,
                         help='number of parallel DoRA1-branch training epochs')
     parser.add_argument('--dora1-val-epoch', type=int, default=5,
                         help='validate DoRA1 every N epochs')
@@ -87,7 +88,7 @@ def parse_args():
     parser.add_argument('--tensorboard-log-interval', type=int, default=10,
                         help='batch interval for TensorBoard and train.log loss')
     parser.add_argument('--is-gray', action='store_true')
-    parser.add_argument('--crop-size', type=int, default=384)
+    parser.add_argument('--crop-size', type=int, default=256)
     parser.add_argument('--downsample-ratio', type=int, default=16)
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)

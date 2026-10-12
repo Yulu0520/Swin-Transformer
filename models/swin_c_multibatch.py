@@ -11,6 +11,7 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
+from .ccst_fusion import CCSTFusion
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -18,7 +19,7 @@ from .swin_dual_dora import (
 )
 
 
-__all__ = ["swin_t_trans", "swin_l_trans"]
+__all__ = ["swin_t_trans", "swin_l_trans", "swin_t_ccst_trans", "swin_l_ccst_trans"]
 
 
 def _load_official_swin_large(backbone, path):
@@ -70,7 +71,8 @@ def _load_official_swin_large(backbone, path):
 class SwinTransMultiBatch(nn.Module):
     """Swin backbone followed by the original multibatch MAN head."""
 
-    def __init__(self, pretrained=True, variant='large', pretrained_path=None):
+    def __init__(self, pretrained=True, variant='large', pretrained_path=None,
+                 ccst_fusion=False):
         super().__init__()
         if variant == 'large':
             backbone = SwinTransformer(
@@ -92,10 +94,15 @@ class SwinTransMultiBatch(nn.Module):
         self.backbone_norm = backbone.norm
 
         # Both backbones end at stride 32; the existing MAN encoder uses 512 channels.
-        self.feature_adapter = nn.Sequential(
-            nn.Conv2d(output_channels, 512, kernel_size=1),
-            nn.GELU(),
-        )
+        if ccst_fusion:
+            self.ccst_fusion = CCSTFusion([
+                output_channels // 8, output_channels // 4,
+                output_channels // 2, output_channels])
+        else:
+            self.feature_adapter = nn.Sequential(
+                nn.Conv2d(output_channels, 512, kernel_size=1),
+                nn.GELU(),
+            )
 
         d_model = 512
         encoder_layer = TransformerEncoderLayer(
@@ -121,10 +128,19 @@ class SwinTransMultiBatch(nn.Module):
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
-        x = self.backbone_norm(x)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.feature_adapter(x)
+        if hasattr(self, 'ccst_fusion'):
+            features = []
+            for index, layer in enumerate(self.backbone_features):
+                x = layer(x)
+                if index in (1, 3, 5, 7):
+                    stage = self.backbone_norm(x) if index == 7 else x
+                    features.append(stage.permute(0, 3, 1, 2).contiguous())
+            x = self.ccst_fusion(features)
+        else:
+            x = self.backbone_features(x)
+            x = self.backbone_norm(x)
+            x = x.permute(0, 3, 1, 2).contiguous()
+            x = self.feature_adapter(x)
 
         batch_size, channels, height, width = x.shape
         tokens = x.flatten(2).permute(2, 0, 1)
@@ -181,3 +197,12 @@ def swin_t_trans(pretrained=True, pretrained_path=None):
 def swin_l_trans(pretrained=True, pretrained_path=None):
     return SwinTransMultiBatch(
         pretrained=pretrained, variant='large', pretrained_path=pretrained_path)
+
+
+def swin_t_ccst_trans(pretrained=True, pretrained_path=None):
+    return SwinTransMultiBatch(pretrained=pretrained, variant='tiny', ccst_fusion=True)
+
+
+def swin_l_ccst_trans(pretrained=True, pretrained_path=None):
+    return SwinTransMultiBatch(pretrained=pretrained, variant='large',
+                               pretrained_path=pretrained_path, ccst_fusion=True)

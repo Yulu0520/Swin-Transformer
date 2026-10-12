@@ -25,7 +25,8 @@ from models.swin_dual_dora import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Evaluate baseline, DoRA, and dual-DoRA checkpoints')
-    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
+    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans',
+                                                'swin_l_ccst_trans', 'swin_t_ccst_trans'],
                         default='swin_t_trans')
     parser.add_argument('--baseline-checkpoint', default='',
                         help='baseline checkpoint; defaults to the latest best_model*.pth')

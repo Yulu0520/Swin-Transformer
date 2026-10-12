@@ -7,6 +7,51 @@ and passed to the original multibatch MAN Transformer encoder and density-map
 head. The original Bayesian and cosine-consistency losses remain in use.
 The CCST count head and CCST trainer are not used.
 
+## Optional CCST fusion before MAN
+
+`swin_t_ccst_trans` and `swin_l_ccst_trans` add spatial fusion inspired by
+[CCST](https://github.com/Boom5426/CCST-Crowd-Counting-with-Swin-Transformer/blob/main/CCST.py):
+
+```text
+Swin stages 1/2/3/4 -> 512-channel projections
+-> stage-1 spatial alignment + 3 AFF modules -> FPN
+-> FAF 12/34 fusion -> adaptive average pooling to stage-4 size
+-> original MAN encoder -> stride-16 density map
+```
+
+Like the reference implementation, all levels are aligned to stage 1 before
+FPN. FAF returns a spatial feature map; the CCST global aggregation and scalar
+count regressor are omitted. Fusion uses 512 channels rather than the reference's
+1536. MAN stays at stride 32 to preserve its original token count. Rectangular
+inputs use actual stage dimensions rather than a square-shape assumption.
+Bayesian and cosine-consistency losses are unchanged.
+
+Start with a new baseline; old baseline/DoRA checkpoints cannot be loaded as
+complete checkpoints for these new models. Swin's existing ImageNet initialization
+is still supported. Existing model names retain their original architecture.
+
+```bash
+python train.py --model-name swin_t_ccst_trans --stage baseline --batch-size 4
+
+# After the new baseline has been trained:
+python train.py --model-name swin_t_ccst_trans --stage dora \
+  --baseline-checkpoint model/swin_t_ccst_trans/baseline/RUN/best_model.pth
+```
+
+AFF/FAF retain the reference BatchNorm layers: baseline training needs at least
+two images per device and drops the final incomplete batch. Single-image
+evaluation and adapter training in evaluation mode are supported. DoRA and DoRA1
+freeze the trained fusion modules together with MAN, and adapt Swin Q/V only.
+High-resolution fusion adds compute and memory even though MAN's token count
+is unchanged; full-image validation may need smaller tiles on limited-memory GPUs.
+
+Fusion source attribution and the upstream MIT license are recorded in
+`models/ccst_fusion.py` and `models/CCST_LICENSE`. Run fusion and integration checks:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_ccst_fusion.py' -v
+```
+
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
 ![image](structure.png)

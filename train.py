@@ -11,10 +11,13 @@ import numpy as np
 import torch
 
 from utils.regression_trainer_cosine_multibatch import RegTrainer
+from models.swin_c_multibatch import normalize_fusion_stages
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Swin + MAN')
+    parser.add_argument('--fusion-stages', nargs='+', type=int, choices=[1, 2, 3],
+                        default=[3], help='stages fused with MAN output (default: 3)')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
@@ -61,7 +64,7 @@ def parse_args():
                         help='DoRA-stage weight decay')
     parser.add_argument('--dora1-weight-decay', type=float, default=1e-5,
                         help='DoRA1-stage weight decay')
-    parser.add_argument('--lr-scheduler', choices=['plateau', 'none'], default='plateau',
+    parser.add_argument('--lr-scheduler', choices=['plateau', 'none'], default='none',
                         help='reduce learning rate when validation RMSE plateaus')
     parser.add_argument('--scheduler-factor', type=float, default=0.5)
     parser.add_argument('--scheduler-patience', type=int, default=3,
@@ -118,6 +121,10 @@ def parse_args():
     parser.add_argument('--background-ratio', type=float, default=0.15)
     
     args = parser.parse_args()
+    try:
+        args.fusion_stages = normalize_fusion_stages(args.fusion_stages)
+    except ValueError as error:
+        parser.error(str(error))
     for name in ('lr', 'dora_lr', 'dora1_lr'):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:

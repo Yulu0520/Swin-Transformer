@@ -25,6 +25,8 @@ from models.swin_dual_dora import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Evaluate baseline, DoRA, and dual-DoRA checkpoints')
+    parser.add_argument('--fusion-stages', nargs='+', type=int, choices=[1, 2, 3],
+                        default=[3], help='must match checkpoint fusion stages')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans')
     parser.add_argument('--baseline-checkpoint', default='',
@@ -66,7 +68,12 @@ def parse_args():
                         help='required when the dual checkpoint is a .pth file')
     parser.add_argument('--dora1-alpha', type=float, default=4.0,
                         help='must match training for a dual .pth checkpoint')
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.fusion_stages = models.normalize_fusion_stages(args.fusion_stages)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
 
 def load_checkpoint(path):
@@ -94,6 +101,7 @@ def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
 
 def build_model(args, checkpoint_path, expect_dora):
     checkpoint = load_checkpoint(checkpoint_path)
+    models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
@@ -143,7 +151,8 @@ def build_model(args, checkpoint_path, expect_dora):
             '{} contains an adapter and is not a baseline checkpoint'.format(
                 checkpoint_path))
 
-    model = getattr(models, args.model_name)(pretrained=False)
+    model = getattr(models, args.model_name)(pretrained=False,
+                                            fusion_stages=args.fusion_stages)
     if expect_dora:
         if contains_parallel:
             model.enable_dual_dora(
@@ -160,6 +169,7 @@ def build_model(args, checkpoint_path, expect_dora):
 
 def build_dual_dora_model(args, checkpoint_path):
     checkpoint = load_checkpoint(checkpoint_path)
+    models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
@@ -194,7 +204,8 @@ def build_dual_dora_model(args, checkpoint_path):
     if not all((dora_rank, dora_alpha, dora1_rank, dora1_alpha)):
         raise ValueError('DoRA and DoRA1 rank/alpha must be positive')
 
-    model = getattr(models, args.model_name)(pretrained=False)
+    model = getattr(models, args.model_name)(pretrained=False,
+                                            fusion_stages=args.fusion_stages)
     model.enable_dual_dora(
         dora_rank, dora_alpha, dora1_rank, dora1_alpha,
         active_route=args.dual_route)

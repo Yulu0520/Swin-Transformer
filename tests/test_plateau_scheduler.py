@@ -18,7 +18,7 @@ class PlateauSchedulerTest(unittest.TestCase):
             lr_scheduler='plateau', scheduler_factor=.5, scheduler_patience=1,
             scheduler_min_lr=2.5e-5, scheduler_threshold=1e-4,
             scheduler_cooldown=0, reset_scheduler=False, stage='baseline',
-            model_name='swin_t_trans', crop_size=256, seed=42,
+            model_name='swin_t_trans', crop_size=256, seed=42, fusion_stages=(3,),
             dora_rank=4, dora_alpha=4., dora1_rank=4, dora1_alpha=4.)
         t.model = nn.Linear(2, 1)
         t.optimizer = torch.optim.Adam(t.model.parameters(), lr=1e-4,

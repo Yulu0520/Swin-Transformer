@@ -1,30 +1,44 @@
 # Boosting-Crowd-Counting-via-Multifaceted-Attention
 Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted Attention'
 
-This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24
-attention blocks). The stage-4 feature is projected from 1536 to 512 channels
-and passed to the original multibatch MAN Transformer encoder. Stage 1, 2,
-and 3 outputs bypass MAN and each receive a separate 1x1 projection to 512
-channels. Their projected features are resized with area averaging to the
-density grid (input height/16 by input width/16, rounded down); the MAN output
-is bilinearly upsampled to that same grid. Each of the four branches receives
-channel-wise LayerNorm without learned affine parameters. The branches are
-concatenated along channels in stage-1, stage-2, stage-3, MAN-output order,
-forming a 2048-channel feature. A learned 1x1 convolution projects it to 512
-channels without an additional activation, then passes it to the existing
-density-map head.
+This version replaces VGG19 with Swin-T by default (2+2+6+2 = 12 attention
+blocks), with optional Swin-L (2+2+18+2 = 24 blocks). The stage-4 feature is
+projected to 512 channels and passed to the multibatch MAN Transformer encoder.
+By default only **stage 3 and the MAN encoder output** enter fusion. Stage 3
+receives a 1x1 projection to 512 channels. Both branches are aligned to the
+density grid (input height/16 by input width/16, rounded down), normalized with
+channel-wise LayerNorm without learned affine parameters, and concatenated to
+1024 channels. A learned 1x1 convolution projects 1024 to 512 channels without
+an additional activation, then passes it to the existing density-map head.
+Selected stage branches use area resizing, while MAN uses bilinear resizing.
+
+`--fusion-stages` selects one or more of stages 1, 2, 3 in both `train.py` and
+`test.py`. MAN output is always included, after the selected stages in ascending
+order. Only selected stage projections are created. Swin still executes all
+four stages to obtain stage 4 for MAN.
+
+```bash
+python train.py --stage all --fusion-stages 3      # default: stage 3 + MAN
+python train.py --stage all --fusion-stages 2      # stage 2 + MAN
+python train.py --stage all --fusion-stages 2 3    # 1536 -> 512 fusion
+python train.py --stage all --fusion-stages 1 2 3  # former 2048 -> 512 fusion
+```
 The original Bayesian and cosine-consistency losses remain in use; consistency
 features still come only from MAN's stage-4 encoder path.
 The CCST count head and CCST trainer are not used.
 
 Train a new baseline with this fusion architecture before training DoRA or
-DoRA1. The three stage projections and fusion convolution train with the
+DoRA1. The selected stage projections and fusion convolution train with the
 baseline and are frozen along with MAN and the density head during adapter
 training. Checkpoints from the former equal-sum architecture lack the fusion
 convolution; stage-4-only checkpoints also lack the stage projections. Neither
 can be loaded directly with the existing strict checkpoint loaders. Swin
-backbone pretraining remains supported. Compare the learned fusion with the
-equal-sum baseline on the same validation split to evaluate its effect.
+backbone pretraining remains supported. Existing four-branch concat-convolution
+checkpoints can still be loaded with `--fusion-stages 1 2 3`. They cannot be
+loaded directly into the default two-branch architecture. Keep the fusion
+selection identical across baseline, DoRA, DoRA1, resume, and evaluation.
+Epoch checkpoints and best-weight JSON metadata record `fusion_stages`; plain
+`.pth` files are checked using their stage projection keys and fusion dimensions.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -33,10 +47,11 @@ equal-sum baseline on the same validation split to evaluate its effect.
 ## Train
 
 Install dependencies with `pip install -r requirements.txt`. By default,
-`python train.py` first trains the full 24-block baseline on `SHA/clean/train`
-and selects its best checkpoint on `SHA/clean/val`. It then freezes that
-baseline and trains Q/V DoRA in all 24 Swin attention blocks on
-`SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
+`python train.py` defaults to the three-stage Swin-T pipeline. It first trains
+the baseline on the configured day training split and validates on day. It
+then freezes that baseline and trains Q/V DoRA in all 12 Swin attention blocks
+on the configured night training split, validating on night, followed by the
+DoRA1 stage using its independently configured data directories. The MAN head
 and custom Transformer stay frozen during DoRA training.
 
 DoRA keeps the low-rank Q/V direction update and learns a separate magnitude

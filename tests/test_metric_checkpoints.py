@@ -21,7 +21,7 @@ class MetricCheckpointTest(unittest.TestCase):
         t.model = nn.ModuleDict({name: nn.Linear(2, 1)
                                 for name in ('baseline', 'dora', 'dora1')})
         t.args = SimpleNamespace(
-            model_name='swin_t_trans', stage='dora1', crop_size=384,
+            model_name='swin_t_trans', stage='dora1', crop_size=384, fusion_stages=(3,),
             dora_rank=4, dora_alpha=4., dora1_rank=4, dora1_alpha=4.,
             seed=42, dora_checkpoint='parent.pth', lr=2e-4, weight_decay=1e-5)
         t.datasets = {'val': SimpleNamespace(root_path='/data/day/val')}

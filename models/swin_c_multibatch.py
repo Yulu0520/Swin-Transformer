@@ -21,6 +21,31 @@ from .swin_dual_dora import (
 __all__ = ["swin_t_trans", "swin_l_trans"]
 
 
+def normalize_fusion_stages(stages):
+    stages = tuple(stages)
+    if not stages or any(stage not in (1, 2, 3) for stage in stages):
+        raise ValueError('fusion stages must be a nonempty selection of 1, 2, 3')
+    if len(set(stages)) != len(stages):
+        raise ValueError('fusion stages must not contain duplicates')
+    return tuple(sorted(stages))
+
+
+def validate_fusion_checkpoint(checkpoint, stages):
+    """Check metadata and projection keys, including plain/legacy state dicts."""
+    requested = normalize_fusion_stages(stages)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    stored = tuple(sorted(int(key.split('.')[1]) + 1 for key in state
+                          if re.fullmatch(r'stage_adapters\.\d+\.weight', key)))
+    metadata = checkpoint.get('fusion_stages')
+    if stored != requested or (metadata is not None and tuple(metadata) != requested):
+        raise ValueError('Checkpoint fusion stages {} do not match requested {}; '
+                         'use matching --fusion-stages or train a new baseline'.format(
+                             stored, requested))
+    weight = state.get('fusion_conv.weight')
+    if weight is None or weight.shape[1] != 512 * (len(requested) + 1):
+        raise ValueError('Checkpoint lacks the matching concat-convolution fusion')
+
+
 def _load_official_swin_large(backbone, path):
     """Map the official Swin-L 22K state dict onto torchvision's Swin-L."""
     if not os.path.isfile(path):
@@ -70,8 +95,10 @@ def _load_official_swin_large(backbone, path):
 class SwinTransMultiBatch(nn.Module):
     """Stage-4 MAN encoder with concat-convolution fusion before regression."""
 
-    def __init__(self, pretrained=True, variant='large', pretrained_path=None):
+    def __init__(self, pretrained=True, variant='large', pretrained_path=None,
+                 fusion_stages=(3,)):
         super().__init__()
+        self.fusion_stages = normalize_fusion_stages(fusion_stages)
         if variant == 'large':
             backbone = SwinTransformer(
                 patch_size=[4, 4], embed_dim=192, depths=[2, 2, 18, 2],
@@ -96,15 +123,19 @@ class SwinTransMultiBatch(nn.Module):
             nn.Conv2d(output_channels, 512, kernel_size=1),
             nn.GELU(),
         )
-        self.stage_adapters = nn.ModuleList([
-            nn.Conv2d(output_channels // divisor, 512, kernel_size=1)
-            for divisor in (8, 4, 2)
-        ])
+        # Stable stage indices preserve keys of former four-branch checkpoints.
+        self.stage_adapters = nn.ModuleDict({
+            str(stage - 1): nn.Conv2d(
+                output_channels // (2 ** (4 - stage)), 512, kernel_size=1)
+            for stage in self.fusion_stages
+        })
         # Normalize each branch over channels without learned branch scaling.
         self.fusion_norms = nn.ModuleList([
-            nn.LayerNorm(512, elementwise_affine=False) for _ in range(4)
+            nn.LayerNorm(512, elementwise_affine=False)
+            for _ in range(len(self.fusion_stages) + 1)
         ])
-        self.fusion_conv = nn.Conv2d(4 * 512, 512, kernel_size=1)
+        self.fusion_conv = nn.Conv2d(
+            (len(self.fusion_stages) + 1) * 512, 512, kernel_size=1)
 
         d_model = 512
         encoder_layer = TransformerEncoderLayer(
@@ -130,12 +161,12 @@ class SwinTransMultiBatch(nn.Module):
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        stage_features = []
+        stage_features = {}
         for index, layer in enumerate(self.backbone_features):
             x = layer(x)
             # Capture outputs after each stage's blocks, before patch merging.
-            if index in (1, 3, 5):
-                stage_features.append(x.permute(0, 3, 1, 2).contiguous())
+            if index in tuple(2 * stage - 1 for stage in self.fusion_stages):
+                stage_features[(index + 1) // 2] = x.permute(0, 3, 1, 2).contiguous()
         x = self.backbone_norm(x)
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
@@ -150,17 +181,16 @@ class SwinTransMultiBatch(nn.Module):
         x = F.interpolate(
             x, size=density_size, mode="bilinear", align_corners=False
         )
-        x = self.fusion_norms[3](x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = self.fusion_norms[-1](x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         branches = []
-        for feature, adapter, norm in zip(
-                stage_features, self.stage_adapters, self.fusion_norms):
-            feature = adapter(feature)
+        for stage, norm in zip(self.fusion_stages, self.fusion_norms):
+            feature = self.stage_adapters[str(stage - 1)](stage_features[stage])
             # Area resizing averages shallow features onto the density grid.
             if feature.shape[-2:] != density_size:
                 feature = F.interpolate(feature, size=density_size, mode="area")
             feature = norm(feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             branches.append(feature)
-        # Keep branch order stable: stage 1, stage 2, stage 3, MAN output.
+        # Selected stages in ascending order, followed by MAN output.
         branches.append(x)
         x = self.fusion_conv(torch.cat(branches, dim=1))
         density = self.reg_layer_0(x)
@@ -201,10 +231,12 @@ class SwinTransMultiBatch(nn.Module):
         return set_swin_adapter_route(self.backbone_features, route)
 
 
-def swin_t_trans(pretrained=True, pretrained_path=None):
-    return SwinTransMultiBatch(pretrained=pretrained, variant='tiny')
+def swin_t_trans(pretrained=True, pretrained_path=None, fusion_stages=(3,)):
+    return SwinTransMultiBatch(pretrained=pretrained, variant='tiny',
+                              fusion_stages=fusion_stages)
 
 
-def swin_l_trans(pretrained=True, pretrained_path=None):
+def swin_l_trans(pretrained=True, pretrained_path=None, fusion_stages=(3,)):
     return SwinTransMultiBatch(
-        pretrained=pretrained, variant='large', pretrained_path=pretrained_path)
+        pretrained=pretrained, variant='large', pretrained_path=pretrained_path,
+        fusion_stages=fusion_stages)

@@ -113,10 +113,12 @@ class RegTrainer(Trainer):
         use_pretrained = (args.stage == 'baseline' and args.pretrained_backbone
                           and not args.resume)
         self.model = model_builder(pretrained=use_pretrained,
-                                   pretrained_path=args.pretrained_path)
+                                   pretrained_path=args.pretrained_path,
+                                   fusion_stages=args.fusion_stages)
         if args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
+                models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'baseline') != 'baseline':
                         raise ValueError('DoRA needs a baseline checkpoint')
@@ -139,6 +141,7 @@ class RegTrainer(Trainer):
                     active_route='dora1', trainable_route='dora1')
             else:
                 checkpoint = load_checkpoint(args.dora_checkpoint)
+                models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'dora') != 'dora':
                         raise ValueError('DoRA1 needs a DoRA checkpoint')
@@ -203,6 +206,7 @@ class RegTrainer(Trainer):
             suf = args.resume.rsplit('.', 1)[-1]
             if suf == 'tar':
                 checkpoint = load_checkpoint(args.resume)
+                models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
                 resumed_state = checkpoint
                 if checkpoint.get('stage', 'baseline') != args.stage:
                     raise ValueError('Resume checkpoint stage does not match')
@@ -234,7 +238,9 @@ class RegTrainer(Trainer):
                 else:
                     self.start_epoch = checkpoint['epoch'] + 1
             elif suf == 'pth':
-                self.model.load_state_dict(load_checkpoint(args.resume))
+                checkpoint = load_checkpoint(args.resume)
+                models.validate_fusion_checkpoint(checkpoint, args.fusion_stages)
+                self.model.load_state_dict(checkpoint)
 
         self.configure_scheduler(resumed_state)
         self.post_prob = Post_Prob(args.sigma,
@@ -443,6 +449,7 @@ class RegTrainer(Trainer):
             'epoch': self.epoch,
             'epoch_index': self.epoch_index,
             'model_name': self.args.model_name,
+            'fusion_stages': self.args.fusion_stages,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
             'adapter_type': ({
@@ -494,6 +501,7 @@ class RegTrainer(Trainer):
                 'validation_images': images,
                 'validation_dir': self.datasets['val'].root_path,
                 'model_name': self.args.model_name,
+                'fusion_stages': self.args.fusion_stages,
                 'stage': self.args.stage,
                 'crop_size': self.args.crop_size,
                 'adapter_type': ('parallel_dora_dora1'

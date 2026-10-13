@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch.nn import functional as F
 
-from models.swin_c_multibatch import swin_t_trans
+from models.swin_c_multibatch import swin_t_trans, validate_fusion_checkpoint
 
 
 class SwinFusionTest(unittest.TestCase):
@@ -18,7 +18,7 @@ class SwinFusionTest(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(7)
-        self.model = swin_t_trans(pretrained=False).eval()
+        self.model = swin_t_trans(pretrained=False, fusion_stages=(1, 2, 3)).eval()
 
     def test_stage4_only_encoder_and_concat_convolution_before_regression(self):
         captured = {}
@@ -66,7 +66,7 @@ class SwinFusionTest(unittest.TestCase):
                 encoder = F.interpolate(encoder, size=(4, 5), mode='bilinear',
                                         align_corners=False)
                 branches = []
-                for index, adapter in zip((1, 3, 5), self.model.stage_adapters):
+                for index, adapter in zip((1, 3, 5), self.model.stage_adapters.values()):
                     feature = adapter(captured['stage_{}'.format(index)].permute(0, 3, 1, 2))
                     branches.append(F.interpolate(feature, size=(4, 5), mode='area'))
                 branches.append(encoder)
@@ -91,7 +91,7 @@ class SwinFusionTest(unittest.TestCase):
             self.model.reg_layer_0[-1].bias.fill_(10.)
         density, _ = self.model(torch.randn(1, 3, 64, 64))
         density.square().mean().backward()
-        modules = list(self.model.stage_adapters) + [
+        modules = list(self.model.stage_adapters.values()) + [
             self.model.feature_adapter[0], self.model.encoder.layers[-1].linear2,
             self.model.backbone_features[1][0].attn.qkv,
             self.model.fusion_conv,
@@ -104,6 +104,7 @@ class SwinFusionTest(unittest.TestCase):
             self.assertGreater(gradient.abs().sum().item(), 0.)
 
     def test_dora_freezes_fusion_and_preserves_initial_prediction(self):
+        self.model = swin_t_trans(pretrained=False).eval()
         inputs = torch.randn(1, 3, 64, 64)
         with torch.no_grad():
             expected, _ = self.model(inputs)
@@ -123,6 +124,45 @@ class SwinFusionTest(unittest.TestCase):
                  if parameter.requires_grad]
         self.assertTrue(names)
         self.assertTrue(all('.parametrizations.weight.0.dora.' in name for name in names))
+
+    def test_default_fuses_only_stage3_and_encoder_with_gradients(self):
+        model = swin_t_trans(pretrained=False).eval()
+        self.assertEqual(model.fusion_stages, (3,))
+        self.assertEqual(list(model.stage_adapters), ['2'])
+        self.assertEqual(model.fusion_conv.in_channels, 1024)
+        captured = {}
+        def capture(module, inputs):
+            captured['fusion'] = inputs[0]
+        handle = model.fusion_conv.register_forward_pre_hook(capture)
+        self.addCleanup(handle.remove)
+        with torch.no_grad():
+            model.reg_layer_0[-1].bias.fill_(10.)
+        density, consistency = model(torch.randn(1, 3, 65, 81))
+        self.assertEqual(density.shape, (1, 1, 4, 5))
+        self.assertEqual(captured['fusion'].shape, (1, 1024, 4, 5))
+        self.assertEqual(len(consistency), 2)
+        density.square().mean().backward()
+        for module in (model.stage_adapters['2'], model.feature_adapter[0],
+                       model.encoder.layers[-1].linear2, model.fusion_conv):
+            self.assertGreater(module.weight.grad.abs().sum().item(), 0.)
+
+    def test_other_combinations_and_checkpoint_validation(self):
+        for stages in ((1,), (2,), (2, 3)):
+            with self.subTest(stages=stages):
+                model = swin_t_trans(pretrained=False, fusion_stages=stages).eval()
+                self.assertEqual(model.fusion_conv.in_channels, 512 * (len(stages) + 1))
+                with torch.no_grad():
+                    density, _ = model(torch.randn(1, 3, 65, 81))
+                self.assertEqual(density.shape, (1, 1, 4, 5))
+                validate_fusion_checkpoint(model.state_dict(), stages)
+                with self.assertRaisesRegex(ValueError, 'fusion stages'):
+                    validate_fusion_checkpoint(model.state_dict(), (3,))
+        validate_fusion_checkpoint(self.model.state_dict(), (1, 2, 3))
+        with self.assertRaisesRegex(ValueError, 'fusion stages'):
+            validate_fusion_checkpoint(self.model.state_dict(), (3,))
+        for stages in ((), (3, 3), (4,)):
+            with self.assertRaises(ValueError):
+                swin_t_trans(pretrained=False, fusion_stages=stages)
 
 
 if __name__ == '__main__':

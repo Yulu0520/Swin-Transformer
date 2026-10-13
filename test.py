@@ -31,7 +31,7 @@ def parse_args():
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--dora-checkpoint', default='',
                         help='DoRA checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1002-132111/best_model.pth',
+    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1013-042059/best_model.pth',
                         help='optional parallel DoRA/DoRA1 checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
                         help='active branch when evaluating the dual checkpoint')
@@ -41,7 +41,7 @@ def parse_args():
         help=('fixed evaluates all requested images with --dual-route; '
               'filename uses names; classifier uses image content'))
     parser.add_argument(
-        '--router-checkpoint', default='model/day_night_router/1001-144417/best_model.pth',
+        '--router-checkpoint', default='/home/mmslab-1080/Desktop/weight/router/best_model.pth',
         help='trained day/night router required by --router-mode classifier')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')

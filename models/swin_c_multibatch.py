@@ -68,7 +68,7 @@ def _load_official_swin_large(backbone, path):
 
 
 class SwinTransMultiBatch(nn.Module):
-    """Swin backbone followed by the original multibatch MAN head."""
+    """Stage-4 MAN encoder with equal-sum multiscale fusion before regression."""
 
     def __init__(self, pretrained=True, variant='large', pretrained_path=None):
         super().__init__()
@@ -96,6 +96,14 @@ class SwinTransMultiBatch(nn.Module):
             nn.Conv2d(output_channels, 512, kernel_size=1),
             nn.GELU(),
         )
+        self.stage_adapters = nn.ModuleList([
+            nn.Conv2d(output_channels // divisor, 512, kernel_size=1)
+            for divisor in (8, 4, 2)
+        ])
+        # Normalize each branch over channels without learned branch scaling.
+        self.fusion_norms = nn.ModuleList([
+            nn.LayerNorm(512, elementwise_affine=False) for _ in range(4)
+        ])
 
         d_model = 512
         encoder_layer = TransformerEncoderLayer(
@@ -121,7 +129,12 @@ class SwinTransMultiBatch(nn.Module):
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
+        stage_features = []
+        for index, layer in enumerate(self.backbone_features):
+            x = layer(x)
+            # Capture outputs after each stage's blocks, before patch merging.
+            if index in (1, 3, 5):
+                stage_features.append(x.permute(0, 3, 1, 2).contiguous())
         x = self.backbone_norm(x)
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
@@ -136,6 +149,15 @@ class SwinTransMultiBatch(nn.Module):
         x = F.interpolate(
             x, size=density_size, mode="bilinear", align_corners=False
         )
+        x = self.fusion_norms[3](x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        for feature, adapter, norm in zip(
+                stage_features, self.stage_adapters, self.fusion_norms):
+            feature = adapter(feature)
+            # Area resizing averages shallow features onto the density grid.
+            if feature.shape[-2:] != density_size:
+                feature = F.interpolate(feature, size=density_size, mode="area")
+            feature = norm(feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            x = x + feature
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 

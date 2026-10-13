@@ -19,23 +19,23 @@ def parse_args():
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='dora1',
+        default='all',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -59,26 +59,26 @@ def parse_args():
                         help='continue the selected stage from its .tar checkpoint')
     
     parser.add_argument('--max-model-num', type=int, default=1)
-    parser.add_argument('--pretrain-epochs', type=int, default=10,
+    parser.add_argument('--pretrain-epochs', type=int, default=600,
                         help='number of clean baseline training epochs')
     parser.add_argument('--pretrain-val-epoch', type=int, default=5,
                         help='validate the baseline every N pretrain epochs')
-    parser.add_argument('--pretrain-val-start', type=int, default=0,
+    parser.add_argument('--pretrain-val-start', type=int, default=200,
                         help='first zero-based pretrain epoch eligible for validation')
     parser.add_argument('--dora-epochs', '--max-epoch', dest='dora_epochs',
-                        type=int, default=10,
+                        type=int, default=1200,
                         help='number of DoRA training epochs')
     parser.add_argument('--dora-val-epoch', '--val-epoch', dest='dora_val_epoch',
                         type=int, default=5,
                         help='validate DoRA every N DoRA training epochs')
     parser.add_argument('--dora-val-start', '--val-start', dest='dora_val_start',
-                        type=int, default=0,
+                        type=int, default=200,
                         help='first zero-based DoRA epoch eligible for validation')
-    parser.add_argument('--dora1-epochs', type=int, default=10,
+    parser.add_argument('--dora1-epochs', type=int, default=1200,
                         help='number of parallel DoRA1-branch training epochs')
     parser.add_argument('--dora1-val-epoch', type=int, default=5,
                         help='validate DoRA1 every N epochs')
-    parser.add_argument('--dora1-val-start', type=int, default=0,
+    parser.add_argument('--dora1-val-start', type=int, default=200,
                         help='first zero-based DoRA1 epoch eligible for validation')
     
     parser.add_argument('--batch-size', type=int, default=4)
@@ -87,7 +87,12 @@ def parse_args():
     parser.add_argument('--tensorboard-log-interval', type=int, default=10,
                         help='batch interval for TensorBoard and train.log loss')
     parser.add_argument('--is-gray', action='store_true')
-    parser.add_argument('--crop-size', type=int, default=384)
+    parser.add_argument('--crop-size', type=int, default=384,
+                        help='shared crop-size fallback for all training stages')
+    parser.add_argument('--baseline-crop-size', type=int, default=256,
+                        help='baseline training crop size; defaults to --crop-size')
+    parser.add_argument('--dora-crop-size', type=int, default=384,
+                        help='DoRA and DoRA1 training crop size; defaults to --crop-size')
     parser.add_argument('--downsample-ratio', type=int, default=16)
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
@@ -123,8 +128,17 @@ def parse_args():
                 val_start >= epochs):
             parser.error('--{}-val-start must be less than --{}-epochs '
                          'to select a best checkpoint'.format(name, name))
-    if args.crop_size <= 0 or args.crop_size % args.downsample_ratio:
-        parser.error('--crop-size must be positive and divisible by --downsample-ratio')
+    if args.downsample_ratio <= 0:
+        parser.error('--downsample-ratio must be positive')
+    if args.baseline_crop_size is None:
+        args.baseline_crop_size = args.crop_size
+    if args.dora_crop_size is None:
+        args.dora_crop_size = args.crop_size
+    for name in ('crop_size', 'baseline_crop_size', 'dora_crop_size'):
+        size = getattr(args, name)
+        if size <= 0 or size % args.downsample_ratio:
+            parser.error('--{} must be positive and divisible by --downsample-ratio'.format(
+                name.replace('_', '-')))
     if args.dora_rank <= 0 or args.dora_alpha <= 0:
         parser.error('DoRA rank and alpha must be positive')
     if args.dora1_rank <= 0 or args.dora1_alpha <= 0:
@@ -144,6 +158,8 @@ def seed_everything(seed):
 def run_stage(args, stage, parent_checkpoint=''):
     stage_args = copy.copy(args)
     stage_args.stage = stage
+    stage_args.crop_size = (args.baseline_crop_size if stage == 'baseline'
+                            else args.dora_crop_size)
     if stage == 'baseline':
         stage_args.max_epoch = args.pretrain_epochs
         stage_args.val_epoch = args.pretrain_val_epoch

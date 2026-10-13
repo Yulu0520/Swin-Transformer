@@ -3,9 +3,26 @@ Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted 
 
 This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24
 attention blocks). The stage-4 feature is projected from 1536 to 512 channels
-and passed to the original multibatch MAN Transformer encoder and density-map
-head. The original Bayesian and cosine-consistency losses remain in use.
+and passed to the original multibatch MAN Transformer encoder. Stage 1, 2,
+and 3 outputs bypass MAN and each receive a separate 1x1 projection to 512
+channels. Their projected features are resized with area averaging to the
+density grid (input height/16 by input width/16, rounded down); the MAN output
+is bilinearly upsampled to that same grid. Each of the four branches receives
+channel-wise LayerNorm without learned affine parameters, then the branches
+are directly summed with coefficients of 1 (no gates, learned fusion weights,
+or division by four). Only this fused feature enters the density-map head.
+The original Bayesian and cosine-consistency losses remain in use; consistency
+features still come only from MAN's stage-4 encoder path.
 The CCST count head and CCST trainer are not used.
+
+Train a new baseline with this fusion architecture before training DoRA or
+DoRA1. The three new stage projections train with the baseline and are frozen
+along with MAN and the density head during adapter training. Checkpoints from
+the former stage-4-only architecture lack these projections and cannot be
+loaded directly with the existing strict checkpoint loaders. Swin backbone
+pretraining remains supported. Equal sum coefficients do not guarantee equal
+contributions to the prediction; this should be evaluated against the earlier
+stage-4-only baseline on the same validation split.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -54,7 +71,23 @@ python train.py --stage all \
   --dora1-val-dir /path/to/day/val
 ```
 
-The default training crop is **256×256**. The official ImageNet-22K
+The default training crop is **384×384**. Baseline and adapter training can
+use separate crop sizes:
+
+```bash
+python train.py --stage both --baseline-crop-size 384 --dora-crop-size 256
+```
+
+`--baseline-crop-size` controls baseline training; `--dora-crop-size` controls
+both DoRA and DoRA1 training. Each defaults to the shared `--crop-size` value
+(384), and an explicit stage-specific value takes precedence. For example,
+`--crop-size 256 --baseline-crop-size 384` uses 384 for baseline and 256 for
+DoRA/DoRA1. Crop sizes must be positive and divisible by `--downsample-ratio`.
+The chosen stage crop size is also used by the Bayesian posterior and saved
+in checkpoint metadata. Validation continues to use full images without
+random cropping.
+
+The official ImageNet-22K
 `swin_large_patch4_window12_384_22k.pth` is read from `pre_models/`, or from
 `--pretrained-path`. Its filename describes pretraining; it does not set this
 project's input size. The 12×12 Swin attention windows are padded as needed

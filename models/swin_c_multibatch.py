@@ -68,7 +68,7 @@ def _load_official_swin_large(backbone, path):
 
 
 class SwinTransMultiBatch(nn.Module):
-    """Stage-4 MAN encoder with equal-sum multiscale fusion before regression."""
+    """Stage-4 MAN encoder with concat-convolution fusion before regression."""
 
     def __init__(self, pretrained=True, variant='large', pretrained_path=None):
         super().__init__()
@@ -104,6 +104,7 @@ class SwinTransMultiBatch(nn.Module):
         self.fusion_norms = nn.ModuleList([
             nn.LayerNorm(512, elementwise_affine=False) for _ in range(4)
         ])
+        self.fusion_conv = nn.Conv2d(4 * 512, 512, kernel_size=1)
 
         d_model = 512
         encoder_layer = TransformerEncoderLayer(
@@ -150,6 +151,7 @@ class SwinTransMultiBatch(nn.Module):
             x, size=density_size, mode="bilinear", align_corners=False
         )
         x = self.fusion_norms[3](x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        branches = []
         for feature, adapter, norm in zip(
                 stage_features, self.stage_adapters, self.fusion_norms):
             feature = adapter(feature)
@@ -157,7 +159,10 @@ class SwinTransMultiBatch(nn.Module):
             if feature.shape[-2:] != density_size:
                 feature = F.interpolate(feature, size=density_size, mode="area")
             feature = norm(feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-            x = x + feature
+            branches.append(feature)
+        # Keep branch order stable: stage 1, stage 2, stage 3, MAN output.
+        branches.append(x)
+        x = self.fusion_conv(torch.cat(branches, dim=1))
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 

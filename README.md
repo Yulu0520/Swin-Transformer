@@ -8,21 +8,23 @@ and 3 outputs bypass MAN and each receive a separate 1x1 projection to 512
 channels. Their projected features are resized with area averaging to the
 density grid (input height/16 by input width/16, rounded down); the MAN output
 is bilinearly upsampled to that same grid. Each of the four branches receives
-channel-wise LayerNorm without learned affine parameters, then the branches
-are directly summed with coefficients of 1 (no gates, learned fusion weights,
-or division by four). Only this fused feature enters the density-map head.
+channel-wise LayerNorm without learned affine parameters. The branches are
+concatenated along channels in stage-1, stage-2, stage-3, MAN-output order,
+forming a 2048-channel feature. A learned 1x1 convolution projects it to 512
+channels without an additional activation, then passes it to the existing
+density-map head.
 The original Bayesian and cosine-consistency losses remain in use; consistency
 features still come only from MAN's stage-4 encoder path.
 The CCST count head and CCST trainer are not used.
 
 Train a new baseline with this fusion architecture before training DoRA or
-DoRA1. The three new stage projections train with the baseline and are frozen
-along with MAN and the density head during adapter training. Checkpoints from
-the former stage-4-only architecture lack these projections and cannot be
-loaded directly with the existing strict checkpoint loaders. Swin backbone
-pretraining remains supported. Equal sum coefficients do not guarantee equal
-contributions to the prediction; this should be evaluated against the earlier
-stage-4-only baseline on the same validation split.
+DoRA1. The three stage projections and fusion convolution train with the
+baseline and are frozen along with MAN and the density head during adapter
+training. Checkpoints from the former equal-sum architecture lack the fusion
+convolution; stage-4-only checkpoints also lack the stage projections. Neither
+can be loaded directly with the existing strict checkpoint loaders. Swin
+backbone pretraining remains supported. Compare the learned fusion with the
+equal-sum baseline on the same validation split to evaluate its effect.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -71,18 +73,57 @@ python train.py --stage all \
   --dora1-val-dir /path/to/day/val
 ```
 
-The default training crop is **384×384**. Baseline and adapter training can
-use separate crop sizes:
+Learning rate and weight decay are independent for each counting stage:
 
 ```bash
-python train.py --stage both --baseline-crop-size 384 --dora-crop-size 256
+python train.py --stage all \
+  --lr 5e-6 --weight-decay 1e-5 \
+  --dora-lr 2e-4 --dora-weight-decay 1e-5 \
+  --dora1-lr 1e-4 --dora1-weight-decay 5e-5
 ```
 
-`--baseline-crop-size` controls baseline training; `--dora-crop-size` controls
-both DoRA and DoRA1 training. Each defaults to the shared `--crop-size` value
-(384), and an explicit stage-specific value takes precedence. For example,
-`--crop-size 256 --baseline-crop-size 384` uses 384 for baseline and 256 for
-DoRA/DoRA1. Crop sizes must be positive and divisible by `--downsample-ratio`.
+`--lr` and `--weight-decay` apply to the baseline. DoRA and DoRA1 use their
+own options (each defaults to learning rate `2e-4` and weight decay `1e-5`).
+When resuming an epoch `.tar`, optimizer moments are restored and weight decay
+uses the selected stage's current setting. If the checkpoint contains a plateau
+scheduler, its settings, progress, and decayed learning rate are also restored.
+Use `--reset-scheduler` to restart the schedule with the current stage learning
+rate and scheduler options. Older checkpoints without scheduler state start a
+new schedule with the current options; `--lr-scheduler none` disables scheduling
+and uses the stage learning rate.
+
+Each stage defaults to its own `ReduceLROnPlateau` scheduler, monitoring
+validation **RMSE** in minimization mode. The shared rule defaults are factor
+`0.5`, patience `3` non-improving validation calls, relative improvement threshold
+`1e-4`, cooldown `0`, and minimum learning rate `1e-7`. The fourth consecutive
+non-improving validation triggers a reduction; patience counts validations,
+not training epochs. Scheduling begins at the existing stage validation start.
+
+```bash
+python train.py --stage all \
+  --scheduler-factor 0.5 --scheduler-patience 3 \
+  --scheduler-min-lr 1e-7 \
+  --pretrain-val-start 0 --dora-val-start 0 --dora1-val-start 0
+```
+
+Epoch `.tar` files include scheduler state for resuming. TensorBoard records
+the learning rate at training epochs and after validation, and `train.log`
+records reductions. Best-weight JSON files record the actual learning rate
+used to train the selected epoch, before the post-validation scheduler step.
+
+Each stage has an independent training crop size: baseline defaults to
+**256×256**, while DoRA and DoRA1 each default to **384×384**.
+
+```bash
+python train.py --stage all \
+  --baseline-crop-size 256 --dora-crop-size 384 --dora1-crop-size 256
+```
+
+`--baseline-crop-size`, `--dora-crop-size`, and `--dora1-crop-size` control
+their respective stages independently. Changing `--dora-crop-size` does not
+change DoRA1's crop size. The stage-specific defaults take precedence over
+the legacy shared `--crop-size` option. Crop sizes must be positive and
+divisible by `--downsample-ratio`.
 The chosen stage crop size is also used by the Bayesian posterior and saved
 in checkpoint metadata. Validation continues to use full images without
 random cropping.
@@ -112,6 +153,22 @@ tensorboard --logdir model
 
 Epoch numbers shown in logs, progress bars, TensorBoard, and checkpoint names
 are 1-based. The two stages have separate schedules:
+
+Each counting stage also saves independent validation minima as
+`best_mae.pth` and `best_rmse.pth` in its run directory. These files contain the
+complete model state dict (including frozen weights and both adapters when
+attached), in the same format as `best_model.pth`. Each is overwritten only
+when its own metric strictly improves. The existing `best_model.pth` selection
+by `MAE + 2 * RMSE` is retained for the sequential training pipeline.
+Companion `best_mae.json` and `best_rmse.json` files record the selected epoch,
+both validation metrics, true MSE (`RMSE ** 2`), validation directory and image
+count, model/stage, crop size, adapter settings, active route, seed, and weights
+path. These best `.pth` files do not contain optimizer state or the standalone
+day/night router. Epoch `.tar` checkpoints retain the optimizer and independent
+best records for resuming; older checkpoints without those records begin
+tracking independent minima at their next validation. Running Python training
+processes must be restarted/resumed to use this code change. No historical
+best-weight files are reconstructed from logs.
 
 | Stage | Epochs | Validate every | First validation index |
 | --- | ---: | ---: | ---: |

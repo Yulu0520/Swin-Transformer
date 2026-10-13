@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from tqdm import tqdm
 import logging
+import json
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
@@ -217,6 +218,14 @@ class RegTrainer(Trainer):
                     raise ValueError('Resume checkpoint adapter settings do not match')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                resume_schedule = (args.lr_scheduler == 'plateau'
+                                   and not args.reset_scheduler
+                                   and checkpoint.get('scheduler_state_dict') is not None)
+                # Preserve the decayed LR when continuing a saved schedule.
+                for group in self.optimizer.param_groups:
+                    if not resume_schedule:
+                        group['lr'] = args.lr
+                    group['weight_decay'] = args.weight_decay
                 # New checkpoints store both the human-facing 1-based epoch
                 # and its internal 0-based index. Older checkpoints only have
                 # the 0-based ``epoch`` field.
@@ -227,6 +236,7 @@ class RegTrainer(Trainer):
             elif suf == 'pth':
                 self.model.load_state_dict(load_checkpoint(args.resume))
 
+        self.configure_scheduler(resumed_state)
         self.post_prob = Post_Prob(args.sigma,
                                    args.crop_size,
                                    args.downsample_ratio,
@@ -238,6 +248,8 @@ class RegTrainer(Trainer):
         self.save_list = Save_Handle(max_num=args.max_model_num)
         self.best_mae = resumed_state.get('best_mae', np.inf)
         self.best_mse = resumed_state.get('best_mse', np.inf)
+        # Separate minima; best_mae/best_mse above belong to the combined score.
+        self.metric_bests = resumed_state.get('metric_bests', {})
         self.best_model_path = resumed_state.get('best_model_path')
         self.save_all = args.save_all
         self.best_count = resumed_state.get('best_count', 0)
@@ -253,6 +265,38 @@ class RegTrainer(Trainer):
             raise ValueError('tensorboard_log_interval must be greater than zero')
         self.writer = SummaryWriter(os.path.join(self.save_dir, 'tensorboard'))
 
+    def configure_scheduler(self, checkpoint):
+        self.scheduler = None
+        if self.args.lr_scheduler == 'plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=self.args.scheduler_factor,
+                patience=self.args.scheduler_patience,
+                min_lr=self.args.scheduler_min_lr,
+                threshold=self.args.scheduler_threshold, threshold_mode='rel',
+                cooldown=self.args.scheduler_cooldown)
+            saved = checkpoint.get('scheduler_state_dict')
+            if saved is not None and not self.args.reset_scheduler:
+                self.scheduler.load_state_dict(saved)
+                logging.info('Restored plateau scheduler state and settings')
+            logging.info('Plateau scheduler: factor=%s, patience=%s validations, '
+                         'min_lr=%s, threshold=%s, cooldown=%s',
+                         self.scheduler.factor, self.scheduler.patience,
+                         self.scheduler.min_lrs, self.scheduler.threshold,
+                         self.scheduler.cooldown)
+
+    def step_scheduler(self, rmse):
+        if self.scheduler is None or not np.isfinite(rmse):
+            return
+        previous = [group['lr'] for group in self.optimizer.param_groups]
+        self.scheduler.step(float(rmse))
+        for index, group in enumerate(self.optimizer.param_groups):
+            self.writer.add_scalar('scheduler/learning_rate_{}'.format(index),
+                                   group['lr'], self.epoch)
+            if group['lr'] != previous[index]:
+                logging.info('%s epoch %d: validation RMSE %.4f; LR %.8g -> %.8g',
+                             self.args.stage, self.epoch, rmse,
+                             previous[index], group['lr'])
+
     def train(self):
         """training process"""
         args = self.args
@@ -263,6 +307,8 @@ class RegTrainer(Trainer):
                 logging.info(
                     '-'*5 + 'Epoch {}/{}'.format(self.epoch, args.max_epoch) + '-'*5
                 )
+                self.writer.add_scalar('train/learning_rate',
+                                       self.optimizer.param_groups[0]['lr'], self.epoch)
                 self.train_eopch()
                 if (
                     self.epoch_index >= args.val_start
@@ -418,10 +464,59 @@ class RegTrainer(Trainer):
             'best_mse': self.best_mse,
             'best_model_path': self.best_model_path,
             'best_count': self.best_count,
+            'metric_bests': self.metric_bests,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': (self.scheduler.state_dict()
+                                     if self.scheduler is not None else None),
             'model_state_dict': model_state_dic
         }, save_path)
         self.save_list.append(save_path)  # control the number of saved models
+
+    def save_metric_bests(self, mae, rmse, images):
+        """Save independent best weights and human-readable validation metadata."""
+        for metric, value in (('mae', mae), ('rmse', rmse)):
+            previous = self.metric_bests.get(metric)
+            if previous is not None and value >= previous['value']:
+                continue
+            if not np.isfinite(value):
+                continue
+            path = os.path.join(self.save_dir, 'best_{}.pth'.format(metric))
+            # Keep the same plain state-dict format as existing best_model.pth.
+            torch.save(self.model.state_dict(), path)
+            metadata = {
+                'selection_metric': metric,
+                'value': float(value),
+                'epoch': self.epoch,
+                'epoch_index': self.epoch_index,
+                'mae': float(mae),
+                'rmse': float(rmse),
+                'mse': float(rmse ** 2),
+                'validation_images': images,
+                'validation_dir': self.datasets['val'].root_path,
+                'model_name': self.args.model_name,
+                'stage': self.args.stage,
+                'crop_size': self.args.crop_size,
+                'adapter_type': ('parallel_dora_dora1'
+                                 if self.args.stage in ('dora', 'dora1') else None),
+                'active_route': (self.args.stage if self.args.stage in
+                                 ('dora', 'dora1') else 'baseline'),
+                'dora_rank': self.args.dora_rank,
+                'dora_alpha': self.args.dora_alpha,
+                'dora1_rank': self.args.dora1_rank,
+                'dora1_alpha': self.args.dora1_alpha,
+                'seed': self.args.seed,
+                'learning_rate': self.optimizer.param_groups[0]['lr'],
+                'initial_learning_rate': self.args.lr,
+                'weight_decay': self.args.weight_decay,
+                'weights_path': path,
+            }
+            with open(os.path.splitext(path)[0] + '.json', 'w',
+                      encoding='utf-8') as metadata_file:
+                json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+                metadata_file.write('\n')
+            self.metric_bests[metric] = metadata
+            logging.info('Saved best %s at epoch %d: MAE %.4f, RMSE %.4f (%s)',
+                         metric.upper(), self.epoch, mae, rmse, path)
 
     def val_epoch(self):
         epoch_start = time.time()
@@ -498,6 +593,7 @@ class RegTrainer(Trainer):
                              time.time()-epoch_start))
 
         model_state_dic = self.model.state_dict()
+        self.save_metric_bests(mae, mse, len(epoch_res))
         logging.info("best mse {:.2f} mae {:.2f}".format(self.best_mse, self.best_mae))
         if (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae):
             self.best_mse = mse
@@ -516,4 +612,8 @@ class RegTrainer(Trainer):
 
         self.writer.add_scalar('best/mae', self.best_mae, self.epoch)
         self.writer.add_scalar('best/rmse', self.best_mse, self.epoch)
+        for metric, record in self.metric_bests.items():
+            self.writer.add_scalar('best_independent/' + metric,
+                                   record['value'], self.epoch)
+        self.step_scheduler(mse)
         self.writer.flush()

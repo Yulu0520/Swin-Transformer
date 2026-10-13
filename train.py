@@ -3,6 +3,7 @@
 import argparse
 import copy
 import gc
+import math
 import os
 import random
 
@@ -19,7 +20,7 @@ def parse_args():
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='all',
+        default='dora1',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
@@ -35,7 +36,7 @@ def parse_args():
     
     parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='',
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1013-133009/best_model.pth',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -54,7 +55,23 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=5*1e-6)
     parser.add_argument('--dora-lr', type=float, default=2e-4)
     parser.add_argument('--dora1-lr', type=float, default=2e-4)
-    parser.add_argument('--weight-decay', type=float, default=1e-5)
+    parser.add_argument('--weight-decay', type=float, default=1e-5,
+                        help='baseline weight decay')
+    parser.add_argument('--dora-weight-decay', type=float, default=1e-5,
+                        help='DoRA-stage weight decay')
+    parser.add_argument('--dora1-weight-decay', type=float, default=1e-5,
+                        help='DoRA1-stage weight decay')
+    parser.add_argument('--lr-scheduler', choices=['plateau', 'none'], default='plateau',
+                        help='reduce learning rate when validation RMSE plateaus')
+    parser.add_argument('--scheduler-factor', type=float, default=0.5)
+    parser.add_argument('--scheduler-patience', type=int, default=3,
+                        help='number of tolerated non-improving validation calls')
+    parser.add_argument('--scheduler-min-lr', type=float, default=1e-7)
+    parser.add_argument('--scheduler-threshold', type=float, default=1e-4,
+                        help='relative threshold for RMSE improvement')
+    parser.add_argument('--scheduler-cooldown', type=int, default=0)
+    parser.add_argument('--reset-scheduler', action='store_true',
+                        help='restart scheduler and stage learning rate when resuming')
     parser.add_argument('--resume', default='',
                         help='continue the selected stage from its .tar checkpoint')
     
@@ -78,7 +95,7 @@ def parse_args():
                         help='number of parallel DoRA1-branch training epochs')
     parser.add_argument('--dora1-val-epoch', type=int, default=5,
                         help='validate DoRA1 every N epochs')
-    parser.add_argument('--dora1-val-start', type=int, default=200,
+    parser.add_argument('--dora1-val-start', type=int, default=0,
                         help='first zero-based DoRA1 epoch eligible for validation')
     
     parser.add_argument('--batch-size', type=int, default=4)
@@ -90,15 +107,41 @@ def parse_args():
     parser.add_argument('--crop-size', type=int, default=384,
                         help='shared crop-size fallback for all training stages')
     parser.add_argument('--baseline-crop-size', type=int, default=256,
-                        help='baseline training crop size; defaults to --crop-size')
+                        help='baseline training crop size (default: 256)')
     parser.add_argument('--dora-crop-size', type=int, default=384,
-                        help='DoRA and DoRA1 training crop size; defaults to --crop-size')
+                        help='DoRA training crop size (default: 384)')
+    parser.add_argument('--dora1-crop-size', type=int, default=384,
+                        help='DoRA1 training crop size (default: 384)')
     parser.add_argument('--downsample-ratio', type=int, default=16)
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
     parser.add_argument('--background-ratio', type=float, default=0.15)
     
     args = parser.parse_args()
+    for name in ('lr', 'dora_lr', 'dora1_lr'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error('--{} must be finite and positive'.format(name.replace('_', '-')))
+    for name in ('weight_decay', 'dora_weight_decay', 'dora1_weight_decay'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error('--{} must be finite and nonnegative'.format(name.replace('_', '-')))
+    if not math.isfinite(args.scheduler_factor) or not 0 < args.scheduler_factor < 1:
+        parser.error('--scheduler-factor must be between 0 and 1')
+    if args.scheduler_patience < 0 or args.scheduler_cooldown < 0:
+        parser.error('scheduler patience and cooldown must be nonnegative')
+    for name in ('scheduler_min_lr', 'scheduler_threshold'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error('--{} must be finite and nonnegative'.format(name.replace('_', '-')))
+    if args.scheduler_threshold >= 1:
+        parser.error('--scheduler-threshold must be less than 1')
+    active_stages = {'all': ('baseline', 'dora', 'dora1'),
+                     'both': ('baseline', 'dora')}.get(args.stage, (args.stage,))
+    stage_lrs = {'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr}
+    if args.lr_scheduler == 'plateau' and any(
+            args.scheduler_min_lr > stage_lrs[stage] for stage in active_stages):
+        parser.error('--scheduler-min-lr must not exceed an active stage learning rate')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
         parser.error('--stage dora needs --baseline-checkpoint or --resume')
     if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):
@@ -134,7 +177,10 @@ def parse_args():
         args.baseline_crop_size = args.crop_size
     if args.dora_crop_size is None:
         args.dora_crop_size = args.crop_size
-    for name in ('crop_size', 'baseline_crop_size', 'dora_crop_size'):
+    if args.dora1_crop_size is None:
+        args.dora1_crop_size = args.crop_size
+    for name in ('crop_size', 'baseline_crop_size', 'dora_crop_size',
+                 'dora1_crop_size'):
         size = getattr(args, name)
         if size <= 0 or size % args.downsample_ratio:
             parser.error('--{} must be positive and divisible by --downsample-ratio'.format(
@@ -158,8 +204,11 @@ def seed_everything(seed):
 def run_stage(args, stage, parent_checkpoint=''):
     stage_args = copy.copy(args)
     stage_args.stage = stage
-    stage_args.crop_size = (args.baseline_crop_size if stage == 'baseline'
-                            else args.dora_crop_size)
+    stage_args.crop_size = {
+        'baseline': args.baseline_crop_size,
+        'dora': args.dora_crop_size,
+        'dora1': args.dora1_crop_size,
+    }[stage]
     if stage == 'baseline':
         stage_args.max_epoch = args.pretrain_epochs
         stage_args.val_epoch = args.pretrain_val_epoch
@@ -175,6 +224,11 @@ def run_stage(args, stage, parent_checkpoint=''):
     stage_args.save_dir = os.path.join(args.save_dir, args.model_name, stage)
     stage_args.lr = {
         'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr,
+    }[stage]
+    stage_args.weight_decay = {
+        'baseline': args.weight_decay,
+        'dora': args.dora_weight_decay,
+        'dora1': args.dora1_weight_decay,
     }[stage]
     if parent_checkpoint:
         if stage == 'dora':

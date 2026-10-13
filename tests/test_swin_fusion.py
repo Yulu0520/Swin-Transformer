@@ -20,7 +20,7 @@ class SwinFusionTest(unittest.TestCase):
         torch.manual_seed(7)
         self.model = swin_t_trans(pretrained=False).eval()
 
-    def test_stage4_only_encoder_and_equal_sum_before_regression(self):
+    def test_stage4_only_encoder_and_concat_convolution_before_regression(self):
         captured = {}
         handles = []
 
@@ -41,7 +41,12 @@ class SwinFusionTest(unittest.TestCase):
         def capture_regression_input(module, inputs):
             captured['regression_input'] = inputs[0]
 
+        def capture_fusion_input(module, inputs):
+            captured['fusion_input'] = inputs[0]
+
         handles.append(self.model.encoder.register_forward_pre_hook(capture_encoder_input))
+        handles.append(self.model.fusion_conv.register_forward_pre_hook(capture_fusion_input))
+        handles.append(self.model.fusion_conv.register_forward_hook(capture('fusion_output')))
         handles.append(self.model.reg_layer_0.register_forward_pre_hook(capture_regression_input))
         try:
             # Odd, rectangular dimensions exercise Swin patch padding and resizing.
@@ -60,15 +65,22 @@ class SwinFusionTest(unittest.TestCase):
                 encoder = captured['encoder'][0].permute(1, 2, 0).reshape_as(stage4)
                 encoder = F.interpolate(encoder, size=(4, 5), mode='bilinear',
                                         align_corners=False)
-                branches = [encoder]
+                branches = []
                 for index, adapter in zip((1, 3, 5), self.model.stage_adapters):
                     feature = adapter(captured['stage_{}'.format(index)].permute(0, 3, 1, 2))
                     branches.append(F.interpolate(feature, size=(4, 5), mode='area'))
-                expected = sum(
+                branches.append(encoder)
+                expected_concat = torch.cat([
                     F.layer_norm(feature.permute(0, 2, 3, 1), (512,)).permute(0, 3, 1, 2)
                     for feature in branches
-                )
+                ], dim=1)
+                self.assertEqual(captured['fusion_input'].shape, (2, 2048, 4, 5))
+                torch.testing.assert_close(captured['fusion_input'], expected_concat)
+                expected = F.conv2d(expected_concat, self.model.fusion_conv.weight,
+                                    self.model.fusion_conv.bias)
+                self.assertEqual(captured['regression_input'].shape, (2, 512, 4, 5))
                 torch.testing.assert_close(captured['regression_input'], expected)
+                self.assertIs(captured['regression_input'], captured['fusion_output'])
         finally:
             for handle in handles:
                 handle.remove()
@@ -82,6 +94,7 @@ class SwinFusionTest(unittest.TestCase):
         modules = list(self.model.stage_adapters) + [
             self.model.feature_adapter[0], self.model.encoder.layers[-1].linear2,
             self.model.backbone_features[1][0].attn.qkv,
+            self.model.fusion_conv,
             self.model.reg_layer_0[-1],
         ]
         for module in modules:
@@ -99,6 +112,8 @@ class SwinFusionTest(unittest.TestCase):
             active_route='dora', trainable_route='dora')
         self.assertTrue(all(not parameter.requires_grad
                             for parameter in self.model.stage_adapters.parameters()))
+        self.assertTrue(all(not parameter.requires_grad
+                            for parameter in self.model.fusion_conv.parameters()))
         for route in ('dora', 'dora1', 'baseline'):
             self.model.set_adapter_route(route)
             with torch.no_grad():

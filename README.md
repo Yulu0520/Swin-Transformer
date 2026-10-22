@@ -6,6 +6,7 @@ attention blocks). The stage-4 feature is projected from 1536 to 512 channels
 and passed to the original multibatch MAN Transformer encoder and density-map
 head. The original Bayesian and cosine-consistency losses remain in use.
 The CCST count head and CCST trainer are not used.
+Training also includes an auxiliary count L1 loss with weight 0.1 by default.
 
 [arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
 
@@ -53,6 +54,31 @@ python train.py --stage all \
   --dora1-train-dir /path/to/night/train \
   --dora1-val-dir /path/to/day/val
 ```
+
+### Auxiliary count L1 loss
+
+The training objective is `Bayesian + consistency + count_loss_weight * count_L1`.
+For each crop, `count_L1` compares the sum of the predicted density map with
+`targets.sum()`, takes the absolute difference, then averages over the batch.
+The target preserves the existing fractional weights for people at crop
+boundaries; empty crops have a target count of zero. No extra count head is used.
+
+Use `--count-loss-weight 0.1` (default) to enable the auxiliary objective, or
+`--count-loss-weight 0` for the original objective. The setting applies to each
+stage being trained; existing baseline and adapter checkpoints remain loadable.
+To train an adapter with this loss without retraining the baseline:
+
+```bash
+python train.py --stage dora \
+  --baseline-checkpoint /path/to/baseline/best_model.pth \
+  --count-loss-weight 0.1
+```
+
+TensorBoard records raw and weighted count loss at step and epoch level.
+`train/crop_count_mae` uses fractional crop targets, whereas the existing
+`train/mae` uses the number of retained annotation points. Full-image validation
+MAE/RMSE and checkpoint selection are unchanged. Epoch `.tar` checkpoints record
+`count_loss_weight`; the CLI value controls the objective when resuming.
 
 The default training crop is **256×256**. The official ImageNet-22K
 `swin_large_patch4_window12_384_22k.pth` is read from `pre_models/`, or from

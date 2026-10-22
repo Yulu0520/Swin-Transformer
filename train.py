@@ -3,6 +3,7 @@
 import argparse
 import copy
 import gc
+import math
 import os
 import random
 
@@ -92,8 +93,12 @@ def parse_args():
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
     parser.add_argument('--background-ratio', type=float, default=0.15)
+    parser.add_argument('--count-loss-weight', type=float, default=0.1,
+                        help='weight of crop count L1; 0 restores the original objective')
     
     args = parser.parse_args()
+    if not math.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
+        parser.error('--count-loss-weight must be finite and nonnegative')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
         parser.error('--stage dora needs --baseline-checkpoint or --resume')
     if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):

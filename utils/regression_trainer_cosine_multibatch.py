@@ -22,6 +22,7 @@ from models.swin_dual_dora import (
 )
 from datasets.crowd import Crowd
 from losses.bay_loss import Bay_Loss
+from losses.count_loss import count_l1_loss
 from losses.post_prob import Post_Prob
 from math import ceil
 import random
@@ -277,6 +278,7 @@ class RegTrainer(Trainer):
         epoch_loss = AverageMeter()
         epoch_bayesian_loss = AverageMeter()
         epoch_consistency_loss = AverageMeter()
+        epoch_count_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
@@ -313,7 +315,11 @@ class RegTrainer(Trainer):
                         layer_features, mean_feature, dim=2, eps=1e-5
                     )
                     loss_c += cosine.sum(dim=1).mean()
-                loss = bayesian_loss + loss_c
+                # Match Bayesian supervision, including fractional people at
+                # crop boundaries. Keep this computation in the autograd graph.
+                count_loss = count_l1_loss(outputs, targets)
+                weighted_count_loss = self.args.count_loss_weight * count_loss
+                loss = bayesian_loss + loss_c + weighted_count_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -325,10 +331,18 @@ class RegTrainer(Trainer):
                 epoch_loss.update(loss.item(), N)
                 epoch_bayesian_loss.update(bayesian_loss.item(), N)
                 epoch_consistency_loss.update(loss_c.item(), N)
+                epoch_count_loss.update(count_loss.item(), N)
                 epoch_mse.update(np.mean(res * res), N)
                 epoch_mae.update(np.mean(abs(res)), N)
 
                 if self.global_step % self.args.tensorboard_log_interval == 0:
+                    self.writer.add_scalar(
+                        'train_step/count_loss', count_loss.item(), self.global_step
+                    )
+                    self.writer.add_scalar(
+                        'train_step/weighted_count_loss',
+                        weighted_count_loss.item(), self.global_step,
+                    )
                     self.writer.add_scalar(
                         'train_step/total_loss', loss.item(), self.global_step
                     )
@@ -348,10 +362,12 @@ class RegTrainer(Trainer):
                     logging.info(
                         '%s Epoch %d/%d Step %d/%d Train: '
                         'total_loss=%.4f, bayesian_loss=%.4f, '
-                        'consistency_loss=%.4f',
+                        'consistency_loss=%.4f, count_loss=%.4f, '
+                        'weighted_count_loss=%.4f',
                         self.args.stage, self.epoch, self.args.max_epoch,
                         step + 1, len(self.dataloaders['train']),
                         loss.item(), bayesian_loss.item(), loss_c.item(),
+                        count_loss.item(), weighted_count_loss.item(),
                         extra={'file_only': True},
                     )
 
@@ -372,18 +388,32 @@ class RegTrainer(Trainer):
             self.epoch,
         )
         self.writer.add_scalar('train/mae', epoch_mae.get_avg(), self.epoch)
+        self.writer.add_scalar(
+            'train/count_loss', epoch_count_loss.get_avg(), self.epoch
+        )
+        self.writer.add_scalar(
+            'train/weighted_count_loss',
+            self.args.count_loss_weight * epoch_count_loss.get_avg(), self.epoch,
+        )
+        # Unlike train/mae (len(points)), this uses fractional crop targets.
+        self.writer.add_scalar(
+            'train/crop_count_mae', epoch_count_loss.get_avg(), self.epoch
+        )
         self.writer.add_scalar('train/rmse', train_rmse, self.epoch)
         self.writer.flush()
 
         logging.info(
             '{} Epoch {} Train, Loss: {:.4f}, Bayesian Loss: {:.4f}, '
-            'Consistency Loss: {:.4f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
+            'Consistency Loss: {:.4f}, Count L1: {:.4f}, '
+            'Weighted Count L1: {:.4f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
             .format(
                 self.args.stage,
                 self.epoch,
                 epoch_loss.get_avg(),
                 epoch_bayesian_loss.get_avg(),
                 epoch_consistency_loss.get_avg(),
+                epoch_count_loss.get_avg(),
+                self.args.count_loss_weight * epoch_count_loss.get_avg(),
                 train_rmse,
                 epoch_mae.get_avg(),
                 time.time()-epoch_start,
@@ -399,6 +429,7 @@ class RegTrainer(Trainer):
             'model_name': self.args.model_name,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
+            'count_loss_weight': self.args.count_loss_weight,
             'adapter_type': ({
                 'dora': 'parallel_dora_dora1',
                 'dora1': 'parallel_dora_dora1',

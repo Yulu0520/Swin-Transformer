@@ -11,6 +11,8 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
+from .swin_dora import QVDoRA
+from .stage3_cross_attention import Stage3CrossAttention
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -88,6 +90,9 @@ class SwinTransMultiBatch(nn.Module):
         else:
             raise ValueError('Unknown Swin variant: {}'.format(variant))
         self.variant = variant
+        self.stage3_channels = output_channels // 2
+        self.stage3_cross_attention = None
+        self.cross_attention_enabled = True
         self.backbone_features = backbone.features
         self.backbone_norm = backbone.norm
 
@@ -121,7 +126,12 @@ class SwinTransMultiBatch(nn.Module):
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
+        if self.stage3_cross_attention is not None and self.cross_attention_enabled:
+            x = self.extract_stage3(x)
+            x = self.stage3_cross_attention(x)
+            x = self.backbone_features[6:](x)
+        else:
+            x = self.backbone_features(x)
         x = self.backbone_norm(x)
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
@@ -138,6 +148,34 @@ class SwinTransMultiBatch(nn.Module):
         )
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
+
+    def extract_stage3(self, images):
+        """Channels-last stride-16 features, before patch merging and Stage 4."""
+        return self.backbone_features[:6](images)
+
+    def enable_cross_attention(self, codebook, heads=8, alpha_init=1.0,
+                               beta_init=0.1, train_fusion=True):
+        if self.stage3_cross_attention is not None:
+            raise ValueError('Stage 3 Cross-Attention is already attached')
+        if codebook.ndim != 2 or codebook.shape[1] != self.stage3_channels:
+            raise ValueError('Memory bank does not match Stage 3 channel dimension')
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+        self.stage3_cross_attention = Stage3CrossAttention(
+            codebook, heads, alpha_init, beta_init, train_fusion)
+        return self.stage3_cross_attention
+
+    def set_inference_domain(self, domain, use_cross_attention=True):
+        """Research workflow routing; daytime uses the unmodified raw baseline."""
+        if domain not in ('day', 'night'):
+            raise ValueError('Inference domain must be day or night')
+        if any(isinstance(module, DualQVDoRAAdapter)
+               for module in self.backbone_features.modules()):
+            raise ValueError('Use set_adapter_route for legacy dual DoRA models')
+        for module in self.backbone_features.modules():
+            if isinstance(module, QVDoRA):
+                module.enabled = domain == 'night'
+        self.cross_attention_enabled = domain == 'night' and use_cross_attention
 
     def enable_dora(self, rank=4, alpha=4.0):
         """Freeze the clean baseline and adapt all backbone attention Q/V."""

@@ -20,18 +20,31 @@ from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
 )
+from utils.stage3_bank import load_file
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Evaluate baseline, DoRA, and dual-DoRA checkpoints')
+    parser.add_argument('--workflow', choices=['legacy', 'memory'], default='memory',
+                        help='memory enables the independent single-DoRA research phases')
+    parser.add_argument('--experiment', choices=['A', 'B', 'C'], default='C',
+                        help='memory workflow: baseline, single DoRA, or Stage 3 fusion')
+    parser.add_argument(
+        '--checkpoint',
+        default='model/swin_t_trans/cross_attention/1026-160522/best_model.pth',
+        help='memory workflow model checkpoint; includes the Phase 3 memory bank')
+    parser.add_argument('--disable-cross-attention', action='store_true')
+    parser.add_argument('--memory-bank-path', default='',
+                        help='optional comparison bank .pt for experiment C; '
+                             'leave empty to use the bank embedded in --checkpoint')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans')
-    parser.add_argument('--baseline-checkpoint', default='',
-                        help='baseline checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora-checkpoint', default='',
-                        help='DoRA checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1002-132111/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='model/swin_t_trans/baseline/1026-154626/best_model.pth',
+                        help='baseline checkpoint; defaults to the latest best_model.pth')
+    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1026-155746/best_model.pth',
+                        help='DoRA checkpoint; defaults to the latest best_model.pth')
+    parser.add_argument('--dora1-checkpoint', default='',
                         help='optional parallel DoRA/DoRA1 checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
                         help='active branch when evaluating the dual checkpoint')
@@ -41,7 +54,7 @@ def parse_args():
         help=('fixed evaluates all requested images with --dual-route; '
               'filename uses names; classifier uses image content'))
     parser.add_argument(
-        '--router-checkpoint', default='model/day_night_router/1001-144417/best_model.pth',
+        '--router-checkpoint', default='',
         help='trained day/night router required by --router-mode classifier')
     parser.add_argument('--checkpoint-root', default='model',
                         help='root used to find default checkpoints')
@@ -70,10 +83,7 @@ def parse_args():
 
 
 def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
+    return load_file(path)
 
 
 def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
@@ -83,8 +93,14 @@ def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
         return explicit_path
 
     pattern = os.path.join(
-        checkpoint_root, model_name, stage, '*', 'best_model*.pth')
+        checkpoint_root, model_name, stage, '*', 'best_model.pth')
     candidates = glob.glob(pattern)
+    if not candidates:
+        # Older --save-all runs only have numbered historical best weights.
+        legacy_pattern = os.path.join(
+            checkpoint_root, model_name, stage, '*', 'best_model_*.pth')
+        candidates = [path for path in glob.glob(legacy_pattern)
+                      if os.path.basename(path)[11:-4].isdigit()]
     if not candidates:
         raise FileNotFoundError(
             'No default {} checkpoint matched {}; provide --{}-checkpoint'.format(
@@ -236,7 +252,8 @@ def evaluate(model, data_dir, args, device, description,
     if not os.path.isdir(data_dir):
         raise FileNotFoundError('Dataset directory not found: {}'.format(data_dir))
     dataset = Crowd(data_dir, args.crop_size, args.downsample_ratio,
-                    is_gray=False, method='val')
+                    is_gray=getattr(model, 'research_config', {}).get('is_gray', False),
+                    method='val')
     if not dataset.im_list:
         raise ValueError('No .jpg images in {}'.format(data_dir))
     loader = DataLoader(
@@ -258,6 +275,10 @@ def evaluate(model, data_dir, args, device, description,
             confidence = ''
             expected_domain, _ = route_from_filename(image_name)
             inputs = inputs.to(device, non_blocking=device.type == 'cuda')
+            if getattr(args, 'workflow', 'legacy') == 'memory':
+                inference_domain = domain if domain in ('day', 'night') else expected_domain
+                model.set_inference_domain(
+                    inference_domain, not args.disable_cross_attention)
             if router_mode == 'filename':
                 detected_domain, route = route_from_filename(image_name)
                 confidence = 1.0
@@ -342,9 +363,42 @@ def write_routing_results(rows, output_path):
 def main():
     args = parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu')
     rows = []
     routing_rows = []
+
+    if args.workflow == 'memory':
+        from utils.memory_workflow import load_research_model
+        from utils.stage3_bank import validate_bank
+        stage = {'A': 'baseline', 'B': 'dora', 'C': 'cross_attention'}[args.experiment]
+        checkpoint_path = resolve_checkpoint(
+            args.checkpoint, args.checkpoint_root, args.model_name, stage)
+        model = load_research_model(load_checkpoint(checkpoint_path), args.model_name,
+                                    args.dora_rank, args.dora_alpha)
+        if model.research_config['stage'] != stage:
+            raise ValueError('Checkpoint does not match experiment ' + args.experiment)
+        if args.memory_bank_path:
+            if stage != 'cross_attention':
+                raise ValueError('Comparison banks require experiment C')
+            bank = validate_bank(load_checkpoint(args.memory_bank_path), args.model_name,
+                                 model.research_config['memory_size'])
+            if bank['baseline_weights_sha256'] != model.research_config['baseline_weights_sha256']:
+                raise ValueError('Comparison bank belongs to a different baseline')
+            model.stage3_cross_attention.codebook.copy_(bank['codebook'])
+        model.to(device).eval()
+        for domain in args.domains:
+            metrics = evaluate(
+                model, os.path.join(args.data_root, domain, args.split), args,
+                device, 'Experiment {} {}'.format(args.experiment, domain),
+                domain=domain)
+            rows.append({
+                'model': 'experiment_' + args.experiment, 'domain': domain,
+                'split': args.split, 'images': metrics['images'],
+                'mae': metrics['mae'], 'rmse': metrics['rmse'],
+                'checkpoint': checkpoint_path})
+        print_results(rows)
+        write_results(rows, args.output_csv)
+        return
 
     if args.router_mode in ('filename', 'classifier'):
         if not args.dora1_checkpoint:

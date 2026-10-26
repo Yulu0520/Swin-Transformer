@@ -17,6 +17,7 @@ class QVDoRA(nn.Module):
 
         dim = weight.shape[1]
         self.scaling = alpha / rank
+        self.enabled = True
         self.dora_A_q = nn.Parameter(weight.new_empty(rank, dim))
         self.dora_B_q = nn.Parameter(weight.new_zeros(dim, rank))
         self.dora_A_v = nn.Parameter(weight.new_empty(rank, dim))
@@ -39,6 +40,8 @@ class QVDoRA(nn.Module):
         return direction * (magnitude / direction_norm).unsqueeze(1)
 
     def forward(self, weight):
+        if not self.enabled:
+            return weight
         q_weight, k_weight, v_weight = weight.chunk(3, dim=0)
         q_update = self.scaling * (self.dora_B_q @ self.dora_A_q)
         v_update = self.scaling * (self.dora_B_v @ self.dora_A_v)

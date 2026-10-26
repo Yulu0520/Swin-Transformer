@@ -1,4 +1,4 @@
 model,domain,split,images,mae,rmse,checkpoint
-classifier_router,day,val,182,72.16728904221084,106.6420058367314,model/swin_t_trans/dora1/1002-132111/best_model.pth
-classifier_router,night,val,182,96.71218515752436,163.64428849846772,model/swin_t_trans/dora1/1002-132111/best_model.pth
-classifier_router,mix,val,364,84.4397370998676,138.11584008912806,model/swin_t_trans/dora1/1002-132111/best_model.pth
+experiment_C,day,val,182,100.13232291923775,138.7805751114932,model/swin_t_trans/cross_attention/1026-160522/best_model.pth
+experiment_C,night,val,182,92.62630095848671,149.75901227867044,model/swin_t_trans/cross_attention/1026-160522/best_model.pth
+experiment_C,mix,val,364,96.37931193886223,144.37418361147496,model/swin_t_trans/cross_attention/1026-160522/best_model.pth

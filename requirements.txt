@@ -7,4 +7,5 @@ opencv-python
 matplotlib
 tqdm
 tensorboard
+scikit-learn>=1.1
 

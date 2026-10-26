@@ -1,4 +1,10 @@
 # Boosting-Crowd-Counting-via-Multifaceted-Attention
+
+The independent daytime baseline → fixed Stage 3 memory bank → nighttime
+single-DoRA → Stage 3 Cross-Attention workflow is documented in
+[docs/MEMORY_WORKFLOW.md](docs/MEMORY_WORKFLOW.md), including complete training,
+evaluation, ablation, and CPU test commands. Select it with `--workflow memory`;
+the legacy double-DoRA workflow remains available.
 Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted Attention'
 
 This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24
@@ -78,7 +84,30 @@ tensorboard --logdir model
 ```
 
 Epoch numbers shown in logs, progress bars, TensorBoard, and checkpoint names
-are 1-based. The two stages have separate schedules:
+are 1-based.
+
+Each baseline, DoRA, and DoRA1 run retains the best five validation weights by
+`MAE + 2 * RMSE` (lower is better). Every validation result can enter this
+ranking, even when it does not improve the best-ever score. Equal scores keep
+the earlier result; non-finite metrics are ignored. Until five validations
+have completed, fewer than five weights may exist.
+
+`best_model.pth` is always rank 1; `best_model_rank2.pth` through
+`best_model_rank5.pth` hold the remaining ranks. `top_models.json` records each
+file's epoch, MAE, RMSE, and score. Use `--save-top-k N` to change the limit.
+`--save-all` overrides this limit: it keeps `best_model.pth` plus a numbered
+archive for every historical best, without a retention cap. Independently,
+`--max-model-num` controls the number of recent epoch `.tar` resume files.
+
+Resume files include the ranking. Resuming copies retained weights into the
+new run directory without changing the source run. Keep the latest `.tar`,
+`top_models.json`, and retained weights together; a stale ranking or missing
+weight causes an error rather than silently restoring incorrect weights.
+Legacy resume files recover only their known best model (its original epoch
+is recorded as unknown). Automatic evaluation selects `best_model.pth`;
+pass an explicit checkpoint path to evaluate another rank.
+
+The stages have separate schedules:
 
 | Stage | Epochs | Validate every | First validation index |
 | --- | ---: | ---: | ---: |

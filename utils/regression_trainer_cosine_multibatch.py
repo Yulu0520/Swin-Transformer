@@ -1,5 +1,7 @@
 from utils.trainer import Trainer
 from utils.helper import Save_Handle, AverageMeter
+from utils.top_checkpoints import TopCheckpoints
+from utils.stage3_bank import load_file
 import os
 import sys
 import time
@@ -25,6 +27,7 @@ from losses.bay_loss import Bay_Loss
 from losses.post_prob import Post_Prob
 from math import ceil
 import random
+import shutil
 
 
 def seed_worker(worker_id):
@@ -34,10 +37,7 @@ def seed_worker(worker_id):
 
 
 def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
+    return load_file(path)
 
 
 def has_dual_dora_adapters(state):
@@ -58,14 +58,15 @@ class RegTrainer(Trainer):
     def setup(self):
         """initial the datasets, model, loss and optimizer"""
         args = self.args
-        if torch.cuda.is_available():
+        if args.device != 'cpu' and torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.device_count = torch.cuda.device_count()
             # for code conciseness, we release the single gpu version
             assert self.device_count == 1
             logging.info('using {} gpus'.format(self.device_count))
         else:
-            raise Exception("gpu is not available")
+            self.device = torch.device('cpu')
+            self.device_count = 1
 
         self.downsample_ratio = args.downsample_ratio
         data_roots = {
@@ -80,6 +81,10 @@ class RegTrainer(Trainer):
             'dora1': {
                 'train': args.dora1_train_dir,
                 'val': args.dora1_val_dir,
+            },
+            'cross_attention': {
+                'train': args.dora_train_dir,
+                'val': args.dora_val_dir,
             },
         }
         active_roots = data_roots[args.stage]
@@ -101,10 +106,120 @@ class RegTrainer(Trainer):
                                           if x == 'train' else 1),
                                           shuffle=(True if x == 'train' else False),
                                           num_workers=args.num_workers*self.device_count,
-                                          pin_memory=(True if x == 'train' else False),
+                                          pin_memory=(x == 'train' and self.device.type == 'cuda'),
                                           worker_init_fn=seed_worker,
                                           generator=loader_generators[x])
                             for x in ['train', 'val']}
+        self.build_model()
+        self.model.to(self.device)
+        named_trainable = [(name, parameter)
+                           for name, parameter in self.model.named_parameters()
+                           if parameter.requires_grad]
+        expected_marker = {
+            'dora': '.parametrizations.weight.0.dora.',
+            'dora1': '.parametrizations.weight.0.dora1.',
+        }.get(args.stage)
+        if getattr(args, 'workflow', 'legacy') == 'memory':
+            expected_marker = {
+                'dora': '.parametrizations.weight.0.',
+                'cross_attention': 'stage3_cross_attention.',
+            }.get(args.stage)
+        if expected_marker is not None:
+            unexpected = [name for name, _ in named_trainable
+                          if expected_marker not in name]
+            if unexpected or not named_trainable:
+                raise RuntimeError(
+                    '{} stage has unexpected trainable parameters: {}'.format(
+                        args.stage, unexpected))
+        trainable = [parameter for _, parameter in named_trainable]
+        logging.info('trainable parameters: %d / %d',
+                     sum(parameter.numel() for parameter in trainable),
+                     sum(parameter.numel() for parameter in self.model.parameters()))
+        self.optimizer = optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
+
+        self.start_epoch = 0
+        resumed_state = {}
+        if args.resume:
+            suf = args.resume.rsplit('.', 1)[-1]
+            if suf == 'tar':
+                checkpoint = load_checkpoint(args.resume)
+                resumed_state = checkpoint
+                if checkpoint.get('stage', 'baseline') != args.stage:
+                    raise ValueError('Resume checkpoint stage does not match')
+                if checkpoint.get('model_name', args.model_name) != args.model_name:
+                    raise ValueError('Resume checkpoint model name does not match')
+                if (getattr(args, 'workflow', 'legacy') == 'legacy'
+                        and args.stage in ('dora', 'dora1')) and (
+                    checkpoint.get('adapter_type') != 'parallel_dora_dora1'
+                    or checkpoint.get('dora_rank') != args.dora_rank
+                    or checkpoint.get('dora_alpha') != args.dora_alpha
+                    or checkpoint.get('dora1_rank') != args.dora1_rank
+                    or checkpoint.get('dora1_alpha') != args.dora1_alpha
+                ):
+                    raise ValueError('Resume checkpoint adapter settings do not match')
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                # New checkpoints store both the human-facing 1-based epoch
+                # and its internal 0-based index. Older checkpoints only have
+                # the 0-based ``epoch`` field.
+                if 'epoch_index' in checkpoint:
+                    self.start_epoch = checkpoint['epoch_index'] + 1
+                else:
+                    self.start_epoch = checkpoint['epoch'] + 1
+            elif suf == 'pth':
+                checkpoint = load_checkpoint(args.resume)
+                self.model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
+
+        self.post_prob = Post_Prob(args.sigma,
+                                   args.crop_size,
+                                   args.downsample_ratio,
+                                   args.background_ratio,
+                                   args.use_background,
+                                   self.device)
+        self.criterion = Bay_Loss(args.use_background, self.device)
+        # self.criterion = torch.nn.MSELoss(reduction='sum')
+        self.save_list = Save_Handle(max_num=args.max_model_num)
+        self.best_mae = resumed_state.get('best_mae', np.inf)
+        self.best_mse = resumed_state.get('best_mse', np.inf)
+        self.best_model_path = resumed_state.get('best_model_path')
+        self.save_all = args.save_all
+        self.best_count = resumed_state.get('best_count', 0)
+        if args.resume and not self.best_model_path:
+            previous_best = os.path.join(os.path.dirname(args.resume), 'best_model.pth')
+            if os.path.isfile(previous_best):
+                self.best_model_path = previous_best
+        if self.best_model_path and not os.path.isfile(self.best_model_path):
+            relocated = os.path.join(os.path.dirname(args.resume),
+                                     os.path.basename(self.best_model_path))
+            if not os.path.isfile(relocated):
+                raise FileNotFoundError('Saved best model is missing: {}'.format(
+                    self.best_model_path))
+            self.best_model_path = relocated
+        self.top_models = TopCheckpoints(
+            self.save_dir, limit=1 if self.save_all else args.save_top_k)
+        retained = resumed_state.get('top_models')
+        if retained is not None:
+            self.top_models.restore(retained, os.path.dirname(args.resume))
+        elif self.best_model_path:
+            # Legacy checkpoints can recover only the one known best model.
+            score = float(self.best_mae + 2.0 * self.best_mse)
+            if np.isfinite(score):
+                self.top_models.restore([{
+                    'epoch': None, 'mae': float(self.best_mae),
+                    'rmse': float(self.best_mse), 'score': score,
+                    'filename': os.path.basename(self.best_model_path),
+                }], os.path.dirname(self.best_model_path))
+        if self.top_models.records:
+            best = self.top_models.records[0]
+            self.best_mae, self.best_mse = best['mae'], best['rmse']
+            self.best_model_path = self.top_models.path()
+        self.global_step = self.start_epoch * len(self.dataloaders['train'])
+        if args.tensorboard_log_interval <= 0:
+            raise ValueError('tensorboard_log_interval must be greater than zero')
+        self.writer = SummaryWriter(os.path.join(self.save_dir, 'tensorboard'))
+
+    def build_model(self):
+        args = self.args
         model_builder = getattr(models, args.model_name, None)
         if model_builder is None:
             raise ValueError('unknown model: {}'.format(args.model_name))
@@ -175,83 +290,15 @@ class RegTrainer(Trainer):
             logging.info(
                 'Dual DoRA active in %d Swin blocks; only DoRA1 is active',
                 count)
-        self.model.to(self.device)
-        named_trainable = [(name, parameter)
-                           for name, parameter in self.model.named_parameters()
-                           if parameter.requires_grad]
-        expected_marker = {
-            'dora': '.parametrizations.weight.0.dora.',
-            'dora1': '.parametrizations.weight.0.dora1.',
-        }.get(args.stage)
-        if expected_marker is not None:
-            unexpected = [name for name, _ in named_trainable
-                          if expected_marker not in name]
-            if unexpected or not named_trainable:
-                raise RuntimeError(
-                    '{} stage has unexpected trainable parameters: {}'.format(
-                        args.stage, unexpected))
-        trainable = [parameter for _, parameter in named_trainable]
-        logging.info('trainable parameters: %d / %d',
-                     sum(parameter.numel() for parameter in trainable),
-                     sum(parameter.numel() for parameter in self.model.parameters()))
-        self.optimizer = optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
-        self.start_epoch = 0
-        resumed_state = {}
-        if args.resume:
-            suf = args.resume.rsplit('.', 1)[-1]
-            if suf == 'tar':
-                checkpoint = load_checkpoint(args.resume)
-                resumed_state = checkpoint
-                if checkpoint.get('stage', 'baseline') != args.stage:
-                    raise ValueError('Resume checkpoint stage does not match')
-                if checkpoint.get('model_name', args.model_name) != args.model_name:
-                    raise ValueError('Resume checkpoint model name does not match')
-                if args.stage in ('dora', 'dora1') and (
-                    checkpoint.get('adapter_type') != 'parallel_dora_dora1'
-                    or checkpoint.get('dora_rank') != args.dora_rank
-                    or checkpoint.get('dora_alpha') != args.dora_alpha
-                    or checkpoint.get('dora1_rank') != args.dora1_rank
-                    or checkpoint.get('dora1_alpha') != args.dora1_alpha
-                ):
-                    raise ValueError('Resume checkpoint adapter settings do not match')
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                # New checkpoints store both the human-facing 1-based epoch
-                # and its internal 0-based index. Older checkpoints only have
-                # the 0-based ``epoch`` field.
-                if 'epoch_index' in checkpoint:
-                    self.start_epoch = checkpoint['epoch_index'] + 1
-                else:
-                    self.start_epoch = checkpoint['epoch'] + 1
-            elif suf == 'pth':
-                self.model.load_state_dict(load_checkpoint(args.resume))
+    def checkpoint_metadata(self):
+        return {}
 
-        self.post_prob = Post_Prob(args.sigma,
-                                   args.crop_size,
-                                   args.downsample_ratio,
-                                   args.background_ratio,
-                                   args.use_background,
-                                   self.device)
-        self.criterion = Bay_Loss(args.use_background, self.device)
-        # self.criterion = torch.nn.MSELoss(reduction='sum')
-        self.save_list = Save_Handle(max_num=args.max_model_num)
-        self.best_mae = resumed_state.get('best_mae', np.inf)
-        self.best_mse = resumed_state.get('best_mse', np.inf)
-        self.best_model_path = resumed_state.get('best_model_path')
-        self.save_all = args.save_all
-        self.best_count = resumed_state.get('best_count', 0)
-        if args.resume and not self.best_model_path:
-            previous_best = os.path.join(os.path.dirname(args.resume), 'best_model.pth')
-            if os.path.isfile(previous_best):
-                self.best_model_path = previous_best
-        if self.best_model_path and not os.path.isfile(self.best_model_path):
-            raise FileNotFoundError('Saved best model is missing: {}'.format(
-                self.best_model_path))
-        self.global_step = self.start_epoch * len(self.dataloaders['train'])
-        if args.tensorboard_log_interval <= 0:
-            raise ValueError('tensorboard_log_interval must be greater than zero')
-        self.writer = SummaryWriter(os.path.join(self.save_dir, 'tensorboard'))
+    def best_weights_payload(self):
+        return self.model.state_dict()
+
+    def best_updated(self):
+        pass
 
     def train(self):
         """training process"""
@@ -315,8 +362,22 @@ class RegTrainer(Trainer):
                     loss_c += cosine.sum(dim=1).mean()
                 loss = bayesian_loss + loss_c
 
+                if getattr(self.args, 'workflow', 'legacy') == 'memory':
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError('Non-finite crowd-counting loss')
+                    cross = self.model.stage3_cross_attention
+                    if cross is not None and self.global_step % self.args.tensorboard_log_interval == 0:
+                        logging.info('Stage 3 fusion: %s', cross.metrics)
+                        for name, value in cross.metrics.items():
+                            self.writer.add_scalar('fusion/' + name, value, self.global_step)
+
                 self.optimizer.zero_grad()
                 loss.backward()
+                if getattr(self.args, 'workflow', 'legacy') == 'memory':
+                    torch.nn.utils.clip_grad_norm_(
+                        [parameter for parameter in self.model.parameters()
+                         if parameter.requires_grad], self.args.max_grad_norm,
+                        error_if_nonfinite=True)
                 self.optimizer.step()
 
                 N = inputs.size(0)
@@ -418,7 +479,9 @@ class RegTrainer(Trainer):
             'best_mse': self.best_mse,
             'best_model_path': self.best_model_path,
             'best_count': self.best_count,
+            'top_models': self.top_models.records,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            **self.checkpoint_metadata(),
             'model_state_dict': model_state_dic
         }, save_path)
         self.save_list.append(save_path)  # control the number of saved models
@@ -497,22 +560,23 @@ class RegTrainer(Trainer):
                      .format(self.args.stage, self.epoch, mse, mae,
                              time.time()-epoch_start))
 
-        model_state_dic = self.model.state_dict()
         logging.info("best mse {:.2f} mae {:.2f}".format(self.best_mse, self.best_mae))
-        if (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae):
-            self.best_mse = mse
-            self.best_mae = mae
-            logging.info("save best mse {:.2f} mae {:.2f} model epoch {}".format(self.best_mse,
-                                                                                 self.best_mae,
-                                                                                 self.epoch))
+        rank = self.top_models.consider(
+            self.epoch, mae, mse,
+            lambda path: torch.save(self.best_weights_payload(), path))
+        if rank is not None:
+            best = self.top_models.records[0]
+            self.best_mae, self.best_mse = best['mae'], best['rmse']
+            self.best_model_path = self.top_models.path()
+            if rank == 1:
+                self.best_updated()
+            logging.info('Saved validation rank %d: epoch %d MAE %.4f '
+                         'RMSE %.4f score %.4f', rank, self.epoch,
+                         mae, mse, mae + 2.0 * mse)
             if self.save_all:
-                self.best_model_path = os.path.join(
-                    self.save_dir, 'best_model_{}.pth'.format(self.best_count))
-                torch.save(model_state_dic, self.best_model_path)
+                shutil.copyfile(self.best_model_path, os.path.join(
+                    self.save_dir, 'best_model_{}.pth'.format(self.best_count)))
                 self.best_count += 1
-            else:
-                self.best_model_path = os.path.join(self.save_dir, 'best_model.pth')
-                torch.save(model_state_dic, self.best_model_path)
 
         self.writer.add_scalar('best/mae', self.best_mae, self.epoch)
         self.writer.add_scalar('best/rmse', self.best_mse, self.epoch)

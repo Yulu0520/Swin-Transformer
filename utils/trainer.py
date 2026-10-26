@@ -8,8 +8,13 @@ class Trainer(object):
     def __init__(self, args):
         sub_dir = datetime.strftime(datetime.now(), '%m%d-%H%M%S')  # prepare saving path
         self.save_dir = os.path.join(args.save_dir, sub_dir)
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+        try:
+            os.makedirs(self.save_dir, exist_ok=False)
+        except FileExistsError:
+            # Fast consecutive runs/resumes must never reuse a source run.
+            self.save_dir = os.path.join(
+                args.save_dir, sub_dir + datetime.now().strftime('-%f'))
+            os.makedirs(self.save_dir, exist_ok=False)
         setlogger(os.path.join(self.save_dir, 'train.log'))  # set logger
         for k, v in args.__dict__.items():  # save args
             logging.info("{}: {}".format(k, v))

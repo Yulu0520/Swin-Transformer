@@ -1,6 +1,7 @@
 """Three standalone training phases sharing the original crowd-counting losses."""
 
 import os
+import logging
 
 from models import swin_c_multibatch as models
 from utils.memory_workflow import (attach_memory, load_research_model,
@@ -45,9 +46,10 @@ class MemoryTrainer(RegTrainer):
                                              args.model_name,
                                              args.dora_rank, args.dora_alpha)
             bank = validate_bank(load_file(args.memory_bank_path), args.model_name,
-                                 args.memory_size)
+                                 args.memory_size, args.memory_stage)
             attach_memory(self.model, bank, args.cross_attention_heads,
-                          args.alpha_init, args.beta_init, not args.freeze_fusion)
+                          args.alpha_init, args.beta_init, not args.freeze_fusion,
+                          memory_stage=args.memory_stage)
         else:
             raise ValueError('Memory workflow supports baseline, dora, cross_attention')
         config = self.model.research_config
@@ -79,5 +81,10 @@ class MemoryTrainer(RegTrainer):
 
     def setup(self):
         super().setup()
+        previous_weight = self.model.research_config.get('count_loss_weight', 0.0)
+        if self.args.resume and previous_weight != self.args.count_loss_weight:
+            logging.info('Resume count_loss_weight: %s -> %s (current arguments)',
+                         previous_weight, self.args.count_loss_weight)
+        self.model.research_config['count_loss_weight'] = self.args.count_loss_weight
         if self.top_models.records:
             self.best_updated()

@@ -1,4 +1,4 @@
-"""Memory-bank format, provenance, and bounded token sampling."""
+"""Stage 3/4 memory banks; module path retained for Stage 3 compatibility."""
 
 import hashlib
 from contextlib import nullcontext
@@ -8,6 +8,9 @@ import torch
 
 
 STAGE3_DIMS = {'swin_t_trans': 384, 'swin_l_trans': 768}
+STAGE4_DIMS = {'swin_t_trans': 768, 'swin_l_trans': 1536}
+STAGE_DIMS = {3: STAGE3_DIMS, 4: STAGE4_DIMS}
+FEATURE_POSITIONS = {3: 'before_stage4_patch_merging', 4: 'before_backbone_norm'}
 
 
 def load_file(path):
@@ -40,7 +43,8 @@ def baseline_fingerprint(state):
     digest = hashlib.sha256()
     normalized = {}
     for name, value in state.items():
-        if name.startswith('stage3_cross_attention.') or '.parametrizations.weight.0.' in name:
+        if (name.startswith(('stage3_cross_attention.', 'stage4_cross_attention.'))
+                or '.parametrizations.weight.0.' in name):
             continue
         name = name.replace('.parametrizations.weight.original', '.weight')
         normalized[name] = value
@@ -52,20 +56,27 @@ def baseline_fingerprint(state):
     return digest.hexdigest()
 
 
-def validate_bank(bank, model_name=None, memory_size=None):
+def validate_bank(bank, model_name=None, memory_size=None, memory_stage=None):
     if not isinstance(bank, dict) or 'codebook' not in bank:
         raise ValueError('Memory bank must include codebook and metadata')
     variant = bank.get('model_name')
-    dim = STAGE3_DIMS.get(variant)
+    stage = bank.get('stage')
+    dim = STAGE_DIMS.get(stage, {}).get(variant)
     codebook = bank['codebook']
-    if (dim is None or bank.get('stage') != 3
+    if (dim is None or not isinstance(codebook, torch.Tensor)
             or bank.get('feature_dim') != dim
             or codebook.ndim != 2
             or tuple(codebook.shape) != (bank.get('memory_size'), dim)
             or codebook.shape[0] <= 0
             or not codebook.is_floating_point()
             or not torch.isfinite(codebook).all()):
-        raise ValueError('Invalid Stage 3 memory bank shape or metadata')
+        raise ValueError('Invalid Stage 3/4 memory bank shape or metadata')
+    # Old Stage 3 banks predate the position field. Stage 4 must be explicit.
+    position = bank.get('feature_position', FEATURE_POSITIONS[3] if stage == 3 else None)
+    if position != FEATURE_POSITIONS[stage]:
+        raise ValueError('Memory bank feature position does not match the supported pre-norm path')
+    if memory_stage is not None and memory_stage != stage:
+        raise ValueError('Memory bank stage {} does not match --memory-stage {}'.format(stage, memory_stage))
     if model_name is not None and model_name != variant:
         raise ValueError('Memory bank Swin variant does not match model')
     if memory_size is not None and memory_size != codebook.shape[0]:
@@ -88,7 +99,7 @@ class TokenReservoir:
     def add(self, tokens):
         tokens = np.asarray(tokens, dtype=np.float32)
         if tokens.ndim != 2 or not np.isfinite(tokens).all():
-            raise ValueError('Expected finite [N, C] sampled Stage 3 tokens')
+            raise ValueError('Expected finite [N, C] sampled memory tokens')
         priorities = self.rng.random(len(tokens))
         if self.tokens is not None:
             tokens = np.concatenate((self.tokens, tokens))

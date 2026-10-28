@@ -29,10 +29,12 @@ def parse_args():
     parser.add_argument('--workflow', choices=['legacy', 'memory'], default='memory',
                         help='memory enables the independent single-DoRA research phases')
     parser.add_argument('--experiment', choices=['A', 'B', 'C'], default='C',
-                        help='memory workflow: baseline, single DoRA, or Stage 3 fusion')
+                        help='memory workflow: baseline, single DoRA, or memory fusion')
+    parser.add_argument('--memory-stage', type=int, choices=[3, 4], default=None,
+                        help='optional checkpoint stage check; auto-discovery defaults to Stage 4')
     parser.add_argument(
         '--checkpoint',
-        default='model/swin_t_trans/cross_attention/1026-160522/best_model.pth',
+        default='',
         help='memory workflow model checkpoint; includes the Phase 3 memory bank')
     parser.add_argument('--disable-cross-attention', action='store_true')
     parser.add_argument('--memory-bank-path', default='',
@@ -86,7 +88,7 @@ def load_checkpoint(path):
     return load_file(path)
 
 
-def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
+def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage, memory_stage=None):
     if explicit_path:
         if not os.path.isfile(explicit_path):
             raise FileNotFoundError('Checkpoint not found: {}'.format(explicit_path))
@@ -94,12 +96,22 @@ def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
 
     pattern = os.path.join(
         checkpoint_root, model_name, stage, '*', 'best_model.pth')
-    candidates = glob.glob(pattern)
+    patterns = [pattern]
+    if stage == 'cross_attention':
+        if memory_stage is not None and memory_stage not in (3, 4):
+            raise ValueError('Memory stage must be 3 or 4')
+        stages = (memory_stage,) if memory_stage is not None else (3, 4)
+        patterns = [os.path.join(checkpoint_root, model_name, stage,
+                                'stage{}'.format(number), '*', 'best_model.pth')
+                    for number in stages]
+        if memory_stage in (None, 3):
+            patterns.append(pattern)  # Original flat Stage 3 run layout.
+    candidates = [path for item in patterns for path in glob.glob(item)]
     if not candidates:
         # Older --save-all runs only have numbered historical best weights.
-        legacy_pattern = os.path.join(
-            checkpoint_root, model_name, stage, '*', 'best_model_*.pth')
-        candidates = [path for path in glob.glob(legacy_pattern)
+        legacy_patterns = [item.replace('best_model.pth', 'best_model_*.pth')
+                           for item in patterns]
+        candidates = [path for item in legacy_patterns for path in glob.glob(item)
                       if os.path.basename(path)[11:-4].isdigit()]
     if not candidates:
         raise FileNotFoundError(
@@ -371,20 +383,25 @@ def main():
         from utils.memory_workflow import load_research_model
         from utils.stage3_bank import validate_bank
         stage = {'A': 'baseline', 'B': 'dora', 'C': 'cross_attention'}[args.experiment]
+        lookup_stage = args.memory_stage
+        if stage == 'cross_attention' and not args.checkpoint and lookup_stage is None:
+            lookup_stage = 4
         checkpoint_path = resolve_checkpoint(
-            args.checkpoint, args.checkpoint_root, args.model_name, stage)
+            args.checkpoint, args.checkpoint_root, args.model_name, stage, lookup_stage)
         model = load_research_model(load_checkpoint(checkpoint_path), args.model_name,
                                     args.dora_rank, args.dora_alpha)
         if model.research_config['stage'] != stage:
             raise ValueError('Checkpoint does not match experiment ' + args.experiment)
+        if stage == 'cross_attention' and lookup_stage is not None and model.memory_stage != lookup_stage:
+            raise ValueError('Checkpoint does not match --memory-stage')
         if args.memory_bank_path:
             if stage != 'cross_attention':
                 raise ValueError('Comparison banks require experiment C')
             bank = validate_bank(load_checkpoint(args.memory_bank_path), args.model_name,
-                                 model.research_config['memory_size'])
+                                 model.research_config['memory_size'], model.memory_stage)
             if bank['baseline_weights_sha256'] != model.research_config['baseline_weights_sha256']:
                 raise ValueError('Comparison bank belongs to a different baseline')
-            model.stage3_cross_attention.codebook.copy_(bank['codebook'])
+            model.active_cross_attention.codebook.copy_(bank['codebook'])
         model.to(device).eval()
         for domain in args.domains:
             metrics = evaluate(

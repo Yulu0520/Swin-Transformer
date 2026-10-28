@@ -13,6 +13,7 @@ from .transformer_cosine_multibatch import (
 from .swin_dora import add_swin_qv_dora
 from .swin_dora import QVDoRA
 from .stage3_cross_attention import Stage3CrossAttention
+from .memory_cross_attention import MemoryCrossAttention
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -91,7 +92,9 @@ class SwinTransMultiBatch(nn.Module):
             raise ValueError('Unknown Swin variant: {}'.format(variant))
         self.variant = variant
         self.stage3_channels = output_channels // 2
+        self.stage4_channels = output_channels
         self.stage3_cross_attention = None
+        self.stage4_cross_attention = None
         self.cross_attention_enabled = True
         self.backbone_features = backbone.features
         self.backbone_norm = backbone.norm
@@ -132,6 +135,8 @@ class SwinTransMultiBatch(nn.Module):
             x = self.backbone_features[6:](x)
         else:
             x = self.backbone_features(x)
+        if self.stage4_cross_attention is not None and self.cross_attention_enabled:
+            x = self.stage4_cross_attention(x)
         x = self.backbone_norm(x)
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
@@ -153,17 +158,46 @@ class SwinTransMultiBatch(nn.Module):
         """Channels-last stride-16 features, before patch merging and Stage 4."""
         return self.backbone_features[:6](images)
 
-    def enable_cross_attention(self, codebook, heads=8, alpha_init=1.0,
-                               beta_init=0.1, train_fusion=True):
+    def extract_stage4(self, images):
+        """Channels-last stride-32 features, after Stage 4 and BEFORE norm."""
+        return self.backbone_features(images)
+
+    def extract_memory_features(self, images, memory_stage):
+        if memory_stage == 3:
+            return self.extract_stage3(images)
+        if memory_stage == 4:
+            return self.extract_stage4(images)
+        raise ValueError('Memory stage must be 3 or 4')
+
+    @property
+    def memory_stage(self):
+        if self.stage4_cross_attention is not None:
+            return 4
         if self.stage3_cross_attention is not None:
-            raise ValueError('Stage 3 Cross-Attention is already attached')
-        if codebook.ndim != 2 or codebook.shape[1] != self.stage3_channels:
-            raise ValueError('Memory bank does not match Stage 3 channel dimension')
+            return 3
+        return None
+
+    @property
+    def active_cross_attention(self):
+        if self.memory_stage is None:
+            return None
+        return getattr(self, 'stage{}_cross_attention'.format(self.memory_stage))
+
+    def enable_cross_attention(self, codebook, heads=8, alpha_init=1.0,
+                               beta_init=0.1, train_fusion=True, memory_stage=3):
+        if memory_stage not in (3, 4):
+            raise ValueError('Memory stage must be 3 or 4')
+        if self.active_cross_attention is not None:
+            raise ValueError('Memory Cross-Attention is already attached')
+        channels = getattr(self, 'stage{}_channels'.format(memory_stage))
+        if codebook.ndim != 2 or codebook.shape[1] != channels:
+            raise ValueError('Memory bank does not match Stage {} channel dimension'.format(memory_stage))
+        attention_class = Stage3CrossAttention if memory_stage == 3 else MemoryCrossAttention
+        attention = attention_class(codebook, heads, alpha_init, beta_init, train_fusion)
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        self.stage3_cross_attention = Stage3CrossAttention(
-            codebook, heads, alpha_init, beta_init, train_fusion)
-        return self.stage3_cross_attention
+        setattr(self, 'stage{}_cross_attention'.format(memory_stage), attention)
+        return attention
 
     def set_inference_domain(self, domain, use_cross_attention=True):
         """Research workflow routing; daytime uses the unmodified raw baseline."""

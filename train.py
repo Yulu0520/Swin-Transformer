@@ -23,12 +23,14 @@ def parse_args():
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     parser.add_argument('--workflow', choices=['legacy', 'memory'], default='legacy',
                         help='memory enables the independent single-DoRA research phases')
-    parser.add_argument('--memory-bank-path', default='stage3_memory_bank.pt')
+    parser.add_argument('--memory-stage', type=int, choices=[3, 4], default=4,
+                        help='Swin feature stage for new Cross-Attention runs; resume uses checkpoint')
+    parser.add_argument('--memory-bank-path', default='')
     parser.add_argument('--memory-size', type=int, default=256)
     parser.add_argument('--cross-attention-heads', type=int, default=8)
     parser.add_argument('--alpha-init', type=float, default=1.0)
     parser.add_argument('--beta-init', type=float, default=0.1)
-    parser.add_argument('--freeze-fusion', action='store_true')
+    parser.add_argument('--freeze-fusion', default=False, action='store_true')
     parser.add_argument('--cross-attention-epochs', type=int, default=15)
     parser.add_argument('--cross-attention-val-epoch', type=int, default=5)
     parser.add_argument('--cross-attention-val-start', type=int, default=0)
@@ -108,8 +110,14 @@ def parse_args():
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
     parser.add_argument('--background-ratio', type=float, default=0.15)
+    parser.add_argument('--count-loss-weight', type=float, default=0.1,
+                        help='weight of crop count L1; 0 restores the original objective')
     
     args = parser.parse_args()
+    if args.memory_bank_path is None:
+        args.memory_bank_path = 'stage{}_memory_bank.pt'.format(args.memory_stage)
+    if not np.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
+        parser.error('--count-loss-weight must be finite and nonnegative')
     if args.stage == 'cross_attention':
         args.workflow = 'memory'
         if not args.resume and not (args.dora_checkpoint and args.memory_bank_path):
@@ -197,6 +205,14 @@ def run_stage(args, stage, parent_checkpoint=''):
         stage_args.val_epoch = args.cross_attention_val_epoch
         stage_args.val_start = args.cross_attention_val_start
     stage_args.save_dir = os.path.join(args.save_dir, args.model_name, stage)
+    if stage == 'cross_attention':
+        if args.resume:
+            from utils.stage3_bank import load_file
+            checkpoint = load_file(args.resume)
+            stage_args.memory_stage = checkpoint.get('research_config', {}).get('memory_stage', 3)
+            del checkpoint
+        stage_args.save_dir = os.path.join(
+            stage_args.save_dir, 'stage{}'.format(stage_args.memory_stage))
     stage_args.lr = {
         'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr,
         'cross_attention': args.cross_attention_lr,

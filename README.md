@@ -1,10 +1,52 @@
 # Boosting-Crowd-Counting-via-Multifaceted-Attention
 
-The independent daytime baseline → fixed Stage 3 memory bank → nighttime
-single-DoRA → Stage 3 Cross-Attention workflow is documented in
+The independent daytime baseline → fixed Stage 3/4 memory bank → nighttime
+single-DoRA → memory Cross-Attention workflow is documented in
 [docs/MEMORY_WORKFLOW.md](docs/MEMORY_WORKFLOW.md), including complete training,
 evaluation, ablation, and CPU test commands. Select it with `--workflow memory`;
 the legacy double-DoRA workflow remains available.
+
+New Cross-Attention training defaults to `--memory-stage 4`: both the daytime
+bank and nighttime queries use Stage 4 features **before backbone norm**. Fusion
+is followed by the original norm, feature adapter, MAN, and density head.
+Use `--memory-stage 3` to reproduce the earlier insertion before Stage 4 patch
+merging. Existing baseline/DoRA weights can be reused; Stage 4 requires a newly
+built bank and newly trained Cross-Attention projections.
+
+```bash
+python build_memory_bank.py --memory-stage 4 \
+  --baseline-checkpoint /path/to/baseline_best.pth \
+  --data-dir /path/to/SHA/day --output stage4_memory_bank.pt
+
+python train.py --workflow memory --stage cross_attention --memory-stage 4 \
+  --dora-checkpoint /path/to/night_dora_best.pth \
+  --memory-bank-path stage4_memory_bank.pt \
+  --dora-train-dir /path/to/SHA/night/train --dora-val-dir /path/to/SHA/night/val
+
+python test.py --workflow memory --experiment C \
+  --checkpoint model/swin_t_trans/cross_attention/stage4/RUN/best_model.pth \
+  --data-root /path/to/SHA --domains day night --split val
+```
+
+Runs are separated under `cross_attention/stage3/` and `cross_attention/stage4/`.
+Explicit checkpoints infer their stage automatically; `test.py --memory-stage`
+can additionally check it. Without an explicit checkpoint, experiment C searches
+Stage 4 by default; pass `--memory-stage 3` to find Stage 3 runs, including the
+original flat layout. Resume restores the checkpoint's stage. The old
+`build_stage3_bank.py` remains a Stage 3-only entrypoint.
+
+Training includes an auxiliary crop count L1 loss, matching the `L1 model`
+project: `Bayesian + consistency + count_loss_weight * count_L1`. The default
+`--count-loss-weight 0.1` applies to every trained stage; use `0` for the original
+objective. Count L1 compares each density-map sum with `targets.sum()`, preserving
+fractional boundary targets, then averages absolute errors across the batch.
+It adds no model parameters and does not change density output or inference.
+Step/epoch logs include raw and weighted count loss, plus epoch
+`train/crop_count_mae` (fractional crop targets, unlike the retained-point-count
+`train/mae`). Epoch checkpoints and memory-workflow best checkpoints record the
+coefficient; the current CLI value controls it when resuming, including old
+checkpoints that have no coefficient. Full-image validation MAE/RMSE and top-five
+checkpoint selection remain unchanged.
 Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted Attention'
 
 This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24

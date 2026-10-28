@@ -159,7 +159,7 @@ class TopCheckpointsTest(unittest.TestCase):
                 trainer.args = SimpleNamespace(
                     stage='baseline', max_epoch=7, model_name='swin_t_trans',
                     crop_size=384, dora_rank=12, dora_alpha=12,
-                    dora1_rank=8, dora1_alpha=8, seed=42)
+                    dora1_rank=8, dora1_alpha=8, seed=42, count_loss_weight=0.1)
                 trainer.device = torch.device('cpu')
                 trainer.model = DensityModel()
                 trainer.optimizer = torch.optim.Adam(trainer.model.parameters())

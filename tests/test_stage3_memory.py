@@ -135,8 +135,9 @@ class Stage3MemoryTest(unittest.TestCase):
         with self.assertRaises(FloatingPointError):
             module(night)
 
-    def test_counting_gradients_and_frozen_weights(self):
+    def _assert_counting_gradients_and_frozen_weights(self, count_loss_only=False):
         from losses.bay_loss import Bay_Loss
+        from losses.count_loss import count_l1_loss
         from losses.post_prob import Post_Prob
         model = self.night()
         bank = make_bank(model)
@@ -154,7 +155,9 @@ class Stage3MemoryTest(unittest.TestCase):
             points, torch.tensor([64.]))
         density, features = model(torch.randn(1, 3, 64, 64))
         self.assertEqual(tuple(density.shape), (1, 1, 4, 4))
-        loss = Bay_Loss(True, 'cpu')(probabilities, [torch.ones(2)], density)
+        loss = (count_l1_loss(density, [torch.tensor([1.0, 0.4])])
+                if count_loss_only else
+                Bay_Loss(True, 'cpu')(probabilities, [torch.ones(2)], density))
         # Verify the COUNT loss alone, without relying on consistency gradients.
         loss.backward()
         for name, parameter in trainable.items():
@@ -172,6 +175,12 @@ class Stage3MemoryTest(unittest.TestCase):
         self.assertFalse(model.stage3_cross_attention.codebook.requires_grad)
         torch.testing.assert_close(model.stage3_cross_attention.codebook, bank['codebook'],
                                    rtol=0, atol=0)
+
+    def test_counting_gradients_and_frozen_weights(self):
+        self._assert_counting_gradients_and_frozen_weights()
+
+    def test_count_l1_reaches_cross_attention_and_keeps_baseline_frozen(self):
+        self._assert_counting_gradients_and_frozen_weights(count_loss_only=True)
 
     def test_day_bypasses_memory_and_adaptation_and_preserves_baseline(self):
         model = self.baseline()
@@ -261,9 +270,12 @@ class Stage3MemoryTest(unittest.TestCase):
         torch.testing.assert_close(cluster_tokens(first.tokens, 8),
                                    cluster_tokens(second.tokens, 8), rtol=0, atol=0)
 
-    def test_three_training_phases_bank_build_evaluation_and_resume(self):
+    def _assert_three_training_phases_bank_build_evaluation_and_resume(self, memory_stage):
         import sys
-        from build_stage3_bank import build_bank
+        if memory_stage == 3:
+            from build_stage3_bank import build_bank
+        else:
+            from build_memory_bank import build_bank
         from train import parse_args, run_stage
         from test import evaluate
 
@@ -286,6 +298,7 @@ class Stage3MemoryTest(unittest.TestCase):
                 '--pretrain-epochs', '1', '--dora-epochs', '1',
                 '--dora-val-start', '0', '--cross-attention-epochs', '1',
                 '--memory-size', '2', '--dora-rank', '2', '--dora-alpha', '2',
+                '--memory-stage', str(memory_stage),
             ]
 
             def run(stage, extra=()):
@@ -297,14 +310,15 @@ class Stage3MemoryTest(unittest.TestCase):
             self.assertTrue((Path(baseline).parent / 'baseline_best.pth').is_symlink())
             self.assertFalse(any('stage3_cross_attention.' in key
                                  for key in load_file(baseline)['model_state_dict']))
-            bank_path = root / 'stage3_memory_bank.pt'
+            bank_path = root / 'stage{}_memory_bank.pt'.format(memory_stage)
             bank_args = SimpleNamespace(
                 baseline_checkpoint=baseline, data_dir=str(root / 'day'),
                 model_name='swin_t_trans', output=str(bank_path), memory_size=2,
                 max_tokens=32, tokens_per_image=16, batch_size=16, seed=42,
-                crop_size=None, is_gray=None, device='cpu')
+                crop_size=None, is_gray=None, device='cpu', memory_stage=memory_stage)
             bank = build_bank(bank_args)
-            self.assertEqual(tuple(bank['codebook'].shape), (2, 384))
+            self.assertEqual(tuple(bank['codebook'].shape), (2, 384 if memory_stage == 3 else 768))
+            self.assertEqual(bank['stage'], memory_stage)
             self.assertEqual(bank['build_parameters']['train_directory'],
                              str(root / 'day' / 'train'))
             night = run('dora', ['--baseline-checkpoint', baseline])
@@ -314,14 +328,24 @@ class Stage3MemoryTest(unittest.TestCase):
             cross = run('cross_attention', ['--dora-checkpoint', night,
                                             '--memory-bank-path', str(bank_path)])
             self.assertTrue((Path(cross).parent / 'night_cross_attention_best.pth').is_symlink())
+            cross_payload = load_file(cross)
+            self.assertEqual(cross_payload['research_config']['memory_stage'], memory_stage)
+            self.assertEqual(Path(cross).parent.parent.name, 'stage{}'.format(memory_stage))
+            self.assertEqual(cross_payload['count_loss_weight'], 0.1)
+            self.assertEqual(cross_payload['research_config']['count_loss_weight'], 0.1)
             checkpoint = Path(cross).parent / '1_ckpt.tar'
             resumed = run('cross_attention', ['--resume', str(checkpoint),
-                                              '--cross-attention-epochs', '2'])
+                                              '--cross-attention-epochs', '2',
+                                              '--memory-stage', str(7 - memory_stage),
+                                              '--count-loss-weight', '0.2'])
             self.assertNotEqual(Path(resumed).parent, Path(cross).parent)
             self.assertTrue(checkpoint.is_file())
             payload = load_file(Path(resumed).parent / '2_ckpt.tar')
             self.assertEqual(payload['epoch_index'], 1)
             self.assertEqual(payload['research_config']['stage'], 'cross_attention')
+            self.assertEqual(payload['research_config']['memory_stage'], memory_stage)
+            self.assertEqual(payload['count_loss_weight'], 0.2)
+            self.assertEqual(payload['research_config']['count_loss_weight'], 0.2)
             model = load_research_model(load_file(resumed)).eval()
             args = SimpleNamespace(crop_size=64, downsample_ratio=16, num_workers=0,
                                    workflow='memory', disable_cross_attention=False)
@@ -331,6 +355,12 @@ class Stage3MemoryTest(unittest.TestCase):
                                    domain=domain)
                 self.assertEqual(metrics['images'], 1)
                 self.assertTrue(np.isfinite(metrics['mae']))
+
+    def test_three_training_phases_bank_build_evaluation_and_resume(self):
+        self._assert_three_training_phases_bank_build_evaluation_and_resume(3)
+
+    def test_stage4_training_bank_build_evaluation_and_resume(self):
+        self._assert_three_training_phases_bank_build_evaluation_and_resume(4)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_cuda_forward_backward(self):

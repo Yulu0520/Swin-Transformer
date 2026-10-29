@@ -18,7 +18,13 @@ from .swin_dual_dora import (
 )
 
 
-__all__ = ["swin_t_trans", "swin_l_trans"]
+__all__ = ["swin_t_trans", "swin_l_trans", "sd15_man"]
+
+
+def sd15_man(pretrained=True, pretrained_path=None):
+    # Keep SD dependencies optional for existing Swin experiments.
+    from .sd_c_multibatch import sd15_man as build
+    return build(pretrained=pretrained, pretrained_path=pretrained_path)
 
 
 def _load_official_swin_large(backbone, path):

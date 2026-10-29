@@ -25,6 +25,7 @@ from losses.bay_loss import Bay_Loss
 from losses.count_loss import count_l1_loss
 from losses.post_prob import Post_Prob
 from math import ceil
+from utils.image_tiles import split_image
 import random
 
 
@@ -87,7 +88,9 @@ class RegTrainer(Trainer):
         self.datasets = {x: Crowd(active_roots[x],
                                   args.crop_size,
                                   args.downsample_ratio,
-                                  args.is_gray, x) for x in ['train', 'val']}
+                                  args.is_gray, x,
+                                  sd_normalization=args.model_name == 'sd15_man')
+                         for x in ['train', 'val']}
         for split in ['train', 'val']:
             if not self.datasets[split].im_list:
                 raise ValueError('No .jpg images in {}'.format(active_roots[split]))
@@ -129,7 +132,7 @@ class RegTrainer(Trainer):
                 args.dora1_rank, args.dora1_alpha,
                 active_route='dora', trainable_route='dora')
             logging.info(
-                'Dual DoRA added to %d Swin blocks; only DoRA is active',
+                'Dual DoRA added to %d backbone targets; only DoRA is active',
                 count)
         elif args.stage == 'dora1':
             if args.resume:
@@ -174,7 +177,7 @@ class RegTrainer(Trainer):
                         args.dora1_rank, args.dora1_alpha,
                         active_route='dora1', trainable_route='dora1')
             logging.info(
-                'Dual DoRA active in %d Swin blocks; only DoRA1 is active',
+                'Dual DoRA active in %d backbone targets; only DoRA1 is active',
                 count)
         self.model.to(self.device)
         named_trainable = [(name, parameter)
@@ -430,6 +433,13 @@ class RegTrainer(Trainer):
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
             'count_loss_weight': self.args.count_loss_weight,
+            'backbone_settings': ({
+                'normalization': 'minus_one_to_one', 'timestep': 0,
+                'latent_scale': 1.0, 'latent_mode': 'mode',
+                'text_cross_attention': False,
+                'feature': 'final_decoder_pooled_stride32',
+                'baseline_vae_trainable': True,
+            } if self.args.model_name == 'sd15_man' else None),
             'adapter_type': ({
                 'dora': 'parallel_dora_dora1',
                 'dora1': 'parallel_dora_dora1',
@@ -475,7 +485,13 @@ class RegTrainer(Trainer):
             h, w = int(h), int(w)
             assert b == 1, 'the batch size should equal to 1 in validation mode'
             input_list = []
-            if h >= 3584 or w >= 3584:
+            if self.args.model_name == 'sd15_man':
+                # Bound global self-attention memory; cover every image pixel once.
+                with torch.no_grad():
+                    predicted_count = sum(
+                        self.model(tile)[0].sum().item()
+                        for tile in split_image(inputs, self.args.crop_size))
+            elif h >= 3584 or w >= 3584:
                 h_stride = int(ceil(1.0 * h / 3584))
                 w_stride = int(ceil(1.0 * w / 3584))
                 h_step = h // h_stride

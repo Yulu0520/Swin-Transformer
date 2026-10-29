@@ -1,5 +1,5 @@
-torch>=1.12
-torchvision>=0.13
+torch>=2.1
+torchvision>=0.16
 numpy
 Pillow
 scipy
@@ -7,4 +7,8 @@ opencv-python
 matplotlib
 tqdm
 tensorboard
+diffusers==0.32.2
+transformers>=4.25,<5
+accelerate
+safetensors
 

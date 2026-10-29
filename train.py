@@ -14,33 +14,33 @@ from utils.regression_trainer_cosine_multibatch import RegTrainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train Swin + MAN')
-    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
-                        default='swin_t_trans',
+    parser = argparse.ArgumentParser(description='Train SD/Swin + MAN')
+    parser.add_argument('--model-name', choices=['sd15_man', 'swin_l_trans', 'swin_t_trans'],
+                        default='sd15_man',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='dora1',
+        default='all',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
-                        default='pre_models/swin_large_patch4_window12_384_22k.pth',
-                        help='official ImageNet-22K Swin-L checkpoint; also works with 256 crops')
+                        default=None,
+                        help='SD 1.5 Diffusers directory/repo, or official Swin-L checkpoint')
     parser.add_argument('--no-pretrained-backbone', dest='pretrained_backbone',
                         action='store_false')
     
@@ -97,6 +97,10 @@ def parse_args():
                         help='weight of crop count L1; 0 restores the original objective')
     
     args = parser.parse_args()
+    if args.model_name == 'sd15_man' and args.downsample_ratio != 16:
+        parser.error('sd15_man requires --downsample-ratio 16')
+    if args.model_name == 'sd15_man' and args.crop_size < 32:
+        parser.error('sd15_man requires --crop-size >= 32')
     if not math.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
         parser.error('--count-loss-weight must be finite and nonnegative')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):

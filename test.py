@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from datasets.crowd import Crowd
 from datasets.day_night import build_router_transform
+from utils.image_tiles import split_image
 from models import swin_c_multibatch as models
 from models.day_night_router import load_day_night_router, prediction_to_route
 from models.swin_dual_dora import (
@@ -25,19 +26,19 @@ from models.swin_dual_dora import (
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Evaluate baseline, DoRA, and dual-DoRA checkpoints')
-    parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
-                        default='swin_t_trans')
+    parser.add_argument('--model-name', choices=['sd15_man', 'swin_l_trans', 'swin_t_trans'],
+                        default='sd15_man')
     parser.add_argument('--baseline-checkpoint', default='',
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--dora-checkpoint', default='',
                         help='DoRA checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1002-132111/best_model.pth',
+    parser.add_argument('--dora1-checkpoint', default='',
                         help='optional parallel DoRA/DoRA1 checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
                         help='active branch when evaluating the dual checkpoint')
     parser.add_argument(
         '--router-mode', choices=['fixed', 'filename', 'classifier'],
-        default='classifier',
+        default='fixed',
         help=('fixed evaluates all requested images with --dual-route; '
               'filename uses names; classifier uses image content'))
     parser.add_argument(
@@ -66,7 +67,11 @@ def parse_args():
                         help='required when the dual checkpoint is a .pth file')
     parser.add_argument('--dora1-alpha', type=float, default=4.0,
                         help='must match training for a dual .pth checkpoint')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.model_name == 'sd15_man' and (
+            args.downsample_ratio != 16 or args.crop_size < 32):
+        parser.error('sd15_man requires --downsample-ratio 16 and --crop-size >= 32')
+    return args
 
 
 def load_checkpoint(path):
@@ -123,6 +128,8 @@ def build_model(args, checkpoint_path, expect_dora):
     )
     contains_parametrization = any(
         '.parametrizations.weight.' in key for key in state)
+    if args.model_name == 'sd15_man':
+        dora_markers = ('direction_A', 'direction_B', 'magnitude')
     contains_dora = all(
         any(marker in key for key in state) for marker in dora_markers)
     contains_parallel = (
@@ -184,6 +191,8 @@ def build_dual_dora_model(args, checkpoint_path):
         'dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v',
         'magnitude_q', 'magnitude_v',
     )
+    if args.model_name == 'sd15_man':
+        dora_markers = ('direction_A', 'direction_B', 'magnitude')
     has_dora = all(any('.dora.{}'.format(marker) in key for key in state)
                    for marker in dora_markers)
     has_dora1 = all(any('.dora1.{}'.format(marker) in key for key in state)
@@ -236,7 +245,8 @@ def evaluate(model, data_dir, args, device, description,
     if not os.path.isdir(data_dir):
         raise FileNotFoundError('Dataset directory not found: {}'.format(data_dir))
     dataset = Crowd(data_dir, args.crop_size, args.downsample_ratio,
-                    is_gray=False, method='val')
+                    is_gray=False, method='val',
+                    sd_normalization=args.model_name == 'sd15_man')
     if not dataset.im_list:
         raise ValueError('No .jpg images in {}'.format(data_dir))
     loader = DataLoader(
@@ -274,7 +284,8 @@ def evaluate(model, data_dir, args, device, description,
                 router_correct += int(detected_domain == expected_domain)
             predicted = sum(
                 model(patch)[0].sum().item()
-                for patch in split_large_image(inputs)
+                for patch in split_image(
+                    inputs, maximum_size=args.crop_size if args.model_name == 'sd15_man' else 3584)
             )
             error = count.item() - predicted
             errors.append(error)

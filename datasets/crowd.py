@@ -30,7 +30,7 @@ def cal_innner_area(c_left, c_up, c_right, c_down, bbox):
 class Crowd(data.Dataset):
     def __init__(self, root_path, crop_size,
                  downsample_ratio, is_gray=False,
-                 method='train'):
+                 method='train', sd_normalization=False):
 
         self.root_path = root_path
         self.im_list = sorted(path for path in glob(os.path.join(self.root_path, '*.jpg'))
@@ -44,7 +44,7 @@ class Crowd(data.Dataset):
         assert self.c_size % self.d_ratio == 0
         self.dc_size = self.c_size // self.d_ratio
 
-        if is_gray:
+        if sd_normalization or is_gray:
             self.trans = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])

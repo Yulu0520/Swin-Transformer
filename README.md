@@ -1,192 +1,188 @@
-# Boosting-Crowd-Counting-via-Multifaceted-Attention
-Official Implement of CVPR 2022 paper 'Boosting Crowd Counting via Multifaceted Attention'
+# Swin crowd counting with CCTrans Regression
 
-This version replaces VGG19 with a Swin-Large backbone (2+2+18+2 = 24
-attention blocks). The stage-4 feature is projected from 1536 to 512 channels
-and passed to the original multibatch MAN Transformer encoder and density-map
-head. The original Bayesian and cosine-consistency losses remain in use.
-The CCST count head and CCST trainer are not used.
-Training also includes an auxiliary count L1 loss with weight 0.1 by default.
+The counting model uses a Swin backbone followed by the multiscale `Regression`
+head adapted from [CCTrans](https://github.com/Yulu0520/CCTrans-Crowd-Counting/blob/71210285a36eb76cb22b3789dd10ee04235a17fa/Networks/ALTGVT.py).
+The MAN encoder, old feature projection/head and cosine consistency objective
+are removed from the active training and inference path. Historical VGG/MAN
+modules remain in the repository for reference.
 
-[arxiv](https://arxiv.org/pdf/2203.02636.pdf) | [知乎](https://zhuanlan.zhihu.com/p/478023612) | [B站](https://www.bilibili.com/video/BV13Y411u7r5?share_source=copy_web)
+## Architecture
 
-![image](structure.png)
+```mermaid
+flowchart TD
+    I[RGB image] --> S1[Swin stage 1]
+    S1 --> S2[Swin stage 2: stride 8]
+    S2 --> S3[Swin stage 3: stride 16]
+    S3 --> S4[Swin stage 4: stride 32 + LayerNorm]
+    S2 --> A[3x3 CBR to 256 channels]
+    S3 --> B[Resize to stage 2 + 3x3 CBR to 256]
+    S4 --> C[Resize to stage 2 + 3x3 CBR to 256]
+    A --> SUM[Elementwise sum]
+    B --> SUM
+    C --> SUM
+    SUM --> D1[3x3 CBR: dilation 1, 256 to 128]
+    SUM --> D2[3x3 CBR: dilation 2, 256 to 128]
+    SUM --> D3[3x3 CBR: dilation 3, 256 to 128]
+    SUM --> SKIP[1x1 CBR: 256 to 384]
+    D1 --> CAT[Concatenate channels: 384]
+    D2 --> CAT
+    D3 --> CAT
+    CAT --> ADD[Elementwise sum]
+    SKIP --> ADD
+    ADD --> HEAD[3x3 CBR: 384 to 64]
+    HEAD --> OUT[1x1 Conv: 64 to 1 + ReLU]
+    OUT --> COUNT[Sum density pixels to predict count]
+```
 
-## Train
+CBR means Conv + BatchNorm + ReLU. Upsampling is bilinear with
+`align_corners=True`, as in CCTrans, but uses the actual stage-2 spatial size
+rather than fixed scale factors. Stage 2/3 have no extra output LayerNorm;
+stage 4 retains the existing backbone LayerNorm.
 
-Install dependencies with `pip install -r requirements.txt`. By default,
-`python train.py` first trains the full 24-block baseline on `SHA/clean/train`
-and selects its best checkpoint on `SHA/clean/val`. It then freezes that
-baseline and trains Q/V DoRA in all 24 Swin attention blocks on
-`SHA/hazy/train`, selecting the best result on `SHA/mix/val`. The MAN head
-and custom Transformer stay frozen during DoRA training.
+| Backbone | Blocks per stage | Heads per stage | Stage 2/3/4 channels | Window |
+| --- | --- | --- | --- | --- |
+| `swin_t_trans` (CLI default) | 2/2/6/2 | 3/6/12/24 | 192/384/768 | 7 |
+| `swin_l_trans` | 2/2/18/2 | 6/12/24/48 | 384/768/1536 | 12 |
 
-DoRA keeps the low-rank Q/V direction update and learns a separate magnitude
-for every Q/V output vector. K remains unchanged. The magnitude is initialized
-from the clean baseline, so attaching DoRA does not change the model output
-before adaptation starts. The parallel DoRA1 branch is present but frozen
-during this stage and is never called by the DoRA forward route.
+A 384x384 crop produces a `[B, 1, 48, 48]` nonnegative density tensor.
+`model(images)` returns this tensor directly, not the old `(density, features)`
+tuple. There is no separate count head or normalized density output.
+For arbitrary validation sizes, input is zero-padded on the bottom/right to a
+multiple of 8; the output is `[B, 1, ceil(H/8), ceil(W/8)]`. All output cells
+participate in the predicted count. Training crops must be divisible by 8.
 
-The optional third stage trains a second DoRA branch named DoRA1 in parallel
-with the trained DoRA branch. Both branches read the same frozen baseline Q/V
-weight, and exactly one branch is evaluated per forward. During DoRA1 training,
-the baseline and complete DoRA branch are frozen and DoRA is not called; only
-DoRA1's direction and magnitude parameters are optimized. Both branches start
-from the clean baseline output. K, the MAN encoder, and the density head are
-shared and frozen.
+## Loss
+
+```text
+total = Bayesian + count_loss_weight * count_L1
+```
+
+`--count-loss-weight` defaults to 0.1. Bayesian supervision (including background
+and its existing foreground-error selection), sigma and background ratio are
+unchanged. Count L1 compares each crop's density sum with `targets.sum()`,
+including fractional people at crop boundaries, then averages over the batch.
+Empty crops have zero target count. No cosine, OT or TV loss is used.
+`--downsample-ratio` is fixed to 8 in training/testing so the Bayesian probability
+grid matches the new head. TensorBoard logs total, Bayesian, raw/weighted count
+loss, MAE and RMSE; consistency scalars are no longer produced.
+
+## Training
+
+Install dependencies with `pip install -r requirements.txt`. Training retains
+the single-GPU requirement. Start by training a new baseline:
 
 ```bash
-python train.py
 python train.py --stage baseline
-python train.py --stage dora \
-  --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth
 
-# Third stage: freeze baseline + DoRA and train only the DoRA1 branch.
-python train.py --stage dora1 \
-  --dora-checkpoint model/swin_t_trans/dora/RUN/best_model.pth \
-  --dora1-train-dir /path/to/night/train \
-  --dora1-val-dir /path/to/day/val \
-  --dora-rank 4 --dora-alpha 4 \
-  --dora1-rank 4 --dora1-alpha 4
-
-# Run all three stages in sequence.
-python train.py --stage all \
-  --dora1-train-dir /path/to/night/train \
-  --dora1-val-dir /path/to/day/val
+# Or run baseline -> DoRA -> DoRA1 in sequence.
+python train.py --stage all
 ```
 
-### Auxiliary count L1 loss
+The CLI still defaults to `--stage dora1`, which requires `--dora-checkpoint`
+or `--resume`; a bare `python train.py` does not start a new baseline.
+Defaults otherwise remain unchanged: Swin-T, 384x384 crops, batch size 4,
+10 epochs per stage, validation every 5 epochs starting at index 0, baseline
+LR 5e-6, adapter LR 2e-4, and weight decay 1e-5.
 
-The training objective is `Bayesian + consistency + count_loss_weight * count_L1`.
-For each crop, `count_L1` compares the sum of the predicted density map with
-`targets.sum()`, takes the absolute difference, then averages over the batch.
-The target preserves the existing fractional weights for people at crop
-boundaries; empty crops have a target count of zero. No extra count head is used.
+| Stage | Default training split | Default validation split | Trainable parameters |
+| --- | --- | --- | --- |
+| baseline | `SHA/day/train` | `SHA/day/val` | Swin + complete Regression head |
+| dora | `SHA/night/train` | `SHA/night/val` | DoRA Q/V direction and magnitude |
+| dora1 | `SHA/night/train` | `SHA/day/val` | DoRA1 Q/V direction and magnitude |
 
-Use `--count-loss-weight 0.1` (default) to enable the auxiliary objective, or
-`--count-loss-weight 0` for the original objective. The setting applies to each
-stage being trained; existing baseline and adapter checkpoints remain loadable.
-To train an adapter with this loss without retraining the baseline:
+The CLI paths point under `/home/mmslab-1080/Desktop/img2img-turbo/`;
+override them with `--data-dir`, `--dora-train-dir`, `--dora-val-dir`,
+`--dora1-train-dir`, and `--dora1-val-dir`. Each split uses jpg images and
+matching npy point annotations. The DoRA1 training split remains night even
+though the inference day route selects DoRA1.
 
 ```bash
-python train.py --stage dora \
-  --baseline-checkpoint /path/to/baseline/best_model.pth \
-  --count-loss-weight 0.1
+python train.py --stage dora --baseline-checkpoint /path/to/NEW/baseline/best_model.pth
+python train.py --stage dora1 --dora-checkpoint /path/to/NEW/dora/best_model.pth
 ```
 
-TensorBoard records raw and weighted count loss at step and epoch level.
-`train/crop_count_mae` uses fractional crop targets, whereas the existing
-`train/mae` uses the number of retained annotation points. Full-image validation
-MAE/RMSE and checkpoint selection are unchanged. Epoch `.tar` checkpoints record
-`count_loss_weight`; the CLI value controls the objective when resuming.
+Both adapters read the same frozen baseline weights and are mutually exclusive.
+They affect Q/V in all 12 Swin-T or 24 Swin-L attention blocks; K and biases
+remain frozen. Default rank/alpha are 4/4 for both branches. In adapter stages,
+the entire model stays in eval mode while only the active adapter receives
+gradients. The new head, including BatchNorm running statistics, stays frozen.
 
-The default training crop is **256×256**. The official ImageNet-22K
-`swin_large_patch4_window12_384_22k.pth` is read from `pre_models/`, or from
-`--pretrained-path`. Its filename describes pretraining; it does not set this
-project's input size. The 12×12 Swin attention windows are padded as needed
-for 256×256 crops. `--no-pretrained-backbone` starts from random weights.
-The optional `--model-name swin_t_trans` retains the earlier 12-block Swin-T
-model; the default `swin_l_trans` has 24 blocks.
+Swin-T uses torchvision ImageNet-1K pretraining. Swin-L reads the official
+ImageNet-22K `pre_models/swin_large_patch4_window12_384_22k.pth`, or
+`--pretrained-path`. `--no-pretrained-backbone` disables ImageNet initialization.
 
-Dataset paths can be changed with `--data-dir`, `--dora-train-dir`,
-`--dora-val-dir`, `--dora1-train-dir`, and `--dora1-val-dir`. The adapter
-directory names are explicit, so experiments such as night training and day
-validation do not depend on the runtime route names. Each split contains
-`.jpg` images and matching `.npy` point
-annotations. `--resume <epoch_ckpt.tar>` continues the selected stage; with
-the default `--stage both`, it resumes the baseline before DoRA starts.
+### Checkpoints and migration
 
-Training and validation progress are displayed with tqdm. TensorBoard scalar
-logs are stored under `model/<model-name>/<stage>/<run>/tensorboard/` and can be viewed with:
-
-```
-tensorboard --logdir model
-```
-
-Epoch numbers shown in logs, progress bars, TensorBoard, and checkpoint names
-are 1-based. The two stages have separate schedules:
-
-| Stage | Epochs | Validate every | First validation index |
-| --- | ---: | ---: | ---: |
-| Clean baseline | `--pretrain-epochs 500` | `--pretrain-val-epoch 5` | `--pretrain-val-start 100` |
-| Hazy/mix DoRA | `--dora-epochs 1200` | `--dora-val-epoch 5` | `--dora-val-start 500` |
-
-The validation starts are **zero-based**. With these defaults, baseline first
-validates after epoch 101 and DoRA first validates after epoch 501. `--max-epoch`,
-`--val-epoch`, and `--val-start` are aliases for the three DoRA options.
-
-
-## Test
+Old MAN checkpoints cannot be used as complete baselines, adapter models or
+resume checkpoints. Train the new Regression head as part of a new baseline,
+then retrain both adapters. To explicitly reuse only an old clean baseline's
+Swin backbone (the head is freshly initialized):
 
 ```bash
-python test.py --data-root SHA --split val \
-  --baseline-checkpoint model/swin_l_trans/baseline/RUN/best_model.pth \
-  --dora-checkpoint model/swin_l_trans/dora/RUN/best_model.pth \
-  --dora1-checkpoint model/swin_l_trans/dora1/RUN/best_model.pth \
-  --dora-rank 4 --dora-alpha 4 \
-  --dora1-rank 4 --dora1-alpha 4 \
-  --dual-route dora1
+python train.py --stage baseline --backbone-checkpoint /path/to/OLD/baseline/best_model.pth
 ```
 
-To route every mixed-set image by its filename, use a DoRA1-stage dual-DoRA
-checkpoint. Files named `IMG_*` use the baseline+DoRA1 branch, while files named
-`night_IMG_*` use the baseline+DoRA branch. The summary CSV contains overall
-MAE/RMSE; the routing CSV records the selected branch and count error for every
-image.
+This option requires a matching Swin variant, a clean baseline without adapters,
+and cannot be combined with resume. It also works with a new clean baseline.
+There is no implicit partial loading of an incompatible head.
+
+Epoch `.tar` checkpoints record `architecture=swin_cctrans_regression_v1`,
+`output_stride=8`, model name, stage, optimizer, crop size, count-loss weight,
+and adapter settings. Best `.pth` files remain raw state dicts; head keys and
+strict weight shapes verify compatibility. Supply matching adapter rank/alpha
+when loading `.pth`. Resume a new-architecture stage with `--resume file.tar`.
+CLI count-loss weight controls the objective on resume. Best-model selection
+remains `2 * RMSE + MAE`. Output paths remain `model/<model-name>/<stage>/<run>/`.
+
+## Evaluation and routing
+
+The existing MobileNetV3-Small router and its checkpoints are unchanged.
+Router input is a separate 224x224 copy; the counting model receives the original
+image. Day selects DoRA1, night selects DoRA. Filename routing uses the `night_`
+prefix; classifier routing uses pixels only.
 
 ```bash
-python test.py \
-  --model-name swin_t_trans \
-  --router-mode filename \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
-  --domains mix --split val \
-  --dora1-checkpoint /path/to/dora1/best_model.pth \
-  --output-csv filename_router_summary.csv \
-  --routing-csv filename_router_details.csv
+python train_router.py --data-root /path/to/SHA/mix
+python test.py --router-mode classifier --domains mix --split val \
+  --dora1-checkpoint /path/to/NEW/dora1/best_model.pth \
+  --router-checkpoint /path/to/router/best_model.pth
+
+python test.py --router-mode filename --domains mix \
+  --dora1-checkpoint /path/to/NEW/dora1/best_model.pth
 ```
 
-Filename routing evaluates only the dual-DoRA checkpoint; separate baseline and
-DoRA checkpoint arguments are not needed in this mode.
+For a fixed-route comparison, set `--router-mode fixed` and supply new baseline,
+DoRA and optional DoRA1 checkpoints. MAE/RMSE and per-image routing CSV formats
+are unchanged. Images at least 3584 pixels on either axis are split as before;
+counts from the non-overlapping patches are summed. The old hardcoded default
+counting-checkpoint path must be overridden with your new checkpoint.
 
-### Image-content day/night router
+## Visualization
 
-Train the MobileNetV3-Small router with filename-derived labels. Filenames are
-used only as training/validation targets; the trained router receives image
-pixels only.
+Both tools accept `--model-name`, adapter rank/alpha, `--dual-route`, `.pth`/`.tar`
+checkpoints, and `--device cpu` (or a GPU index).
 
 ```bash
-python train_router.py \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA/mix \
-  --epochs 20 --batch-size 32 --device cuda:0
+python save_density_and_var.py --data-dir /path/to/val \
+  --model-path /path/to/NEW/best_model.pth
+python save_attention.py --data-dir /path/to/image.jpg \
+  --model-path /path/to/NEW/best_model.pth
 ```
 
-Use its best checkpoint for content-based dynamic routing. The router resizes a
-separate copy to 224x224; the crowd-counting input keeps its original size.
+`save_density_and_var.py` saves native-stride density arrays and color previews.
+`save_attention.py` now saves channel-mean activation-magnitude overlays for the
+fused 256-channel features and the 384-channel regression features. These are
+feature visualizations, not MAN attention maps.
+
+## Verification
 
 ```bash
-python test.py \
-  --model-name swin_t_trans \
-  --router-mode classifier \
-  --router-checkpoint model/day_night_router/RUN/best_model.pth \
-  --data-root /home/mmslab-1080/Desktop/img2img-turbo/SHA \
-  --domains mix --split val \
-  --dora1-checkpoint /path/to/dora1/best_model.pth \
-  --output-csv classifier_router_summary.csv \
-  --routing-csv classifier_router_details.csv
+python -m unittest discover -s tests -v
 ```
 
-The routing CSV includes the filename-derived expected domain for evaluation,
-the image-router prediction and confidence, the selected adapter, and the count
-error. Runtime branch selection remains:
-
-- predicted day -> baseline + DoRA1
-- predicted night -> baseline + DoRA
-
-Epoch `.tar` checkpoints contain stage, model name, optimizer, and both adapter
-settings. Best `.pth` checkpoints contain model weights; supply the DoRA and
-DoRA1 rank/alpha values when loading a parallel `.pth` checkpoint. The active
-route is selected at runtime and is not stored as a learned parameter.
-
+The tests cover both backbones, arbitrary image sizes, Bayesian/count-loss
+gradients through every selected stage, frozen adapter-stage BatchNorm, route
+selection, checkpoint compatibility and the existing router/DoRA behavior.
 
 ## Citation
 If you use this code for your research, please cite our paper:

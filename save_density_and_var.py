@@ -1,7 +1,9 @@
-import torch
 import os
 import numpy as np
-from models.swin_c_multibatch import swin_t_trans
+import torch
+from utils.counting_visualization import (
+    add_model_arguments, load_visualization_model, visualization_device,
+)
 from glob import glob
 from torchvision import transforms
 from PIL import Image
@@ -20,13 +22,14 @@ def parse_args():
     parser.add_argument('--model-path', default='model/best_model.pth',
                         help='model directory')
     parser.add_argument('--device', default='0', help='assign device')
+    add_model_arguments(parser)
     args = parser.parse_args()
     return args
 
 
 if __name__ == '__main__':
     args = parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()  # set vis gpu
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip() if args.device != 'cpu' else ''  # set vis gpu
     torch.backends.cudnn.benchmark = False
     save_dir = os.path.dirname(args.model_path)
 
@@ -48,10 +51,8 @@ if __name__ == '__main__':
     im_list = glob(os.path.join(args.data_dir, '*.jpg'))
 
 
-    device = torch.device('cuda')
-    model = swin_t_trans(pretrained=False)
-    model.to(device)
-    model.load_state_dict(torch.load(args.model_path, device))
+    device = visualization_device(args.device)
+    model = load_visualization_model(args, device)
     epoch_minus = []
     num = 0
 
@@ -68,12 +69,12 @@ if __name__ == '__main__':
         inputs = img.to(device)
         assert inputs.size(0) == 1, 'the batch size should equal to 1'
         with torch.set_grad_enabled(False):
-            outputs = model(inputs)[0]
+            outputs = model(inputs)
             logf = '{}gd_{:.2f}_bpre_{:.2f}.jpg'.format(num, len(keypoints), torch.sum(outputs))
             num += 1
             # logf = 'bpre_{:.2f}'.format(torch.sum(outputs))
             outputs = outputs.detach().cpu().numpy()[0][0]
-            # np.save(os.path.join(save_dir_d, name), outputs)
+            np.save(os.path.join(save_dir_d, os.path.splitext(os.path.basename(im_path))[0] + '.npy'), outputs)
 
 
             outputs = cv2.resize(outputs, (w, h)) / 1.0

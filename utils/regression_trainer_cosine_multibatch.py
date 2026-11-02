@@ -4,7 +4,6 @@ import os
 import sys
 import time
 import torch
-import torch.nn.functional as F
 from torch import optim
 # The system protobuf extension can be incompatible with the active libstdc++.
 os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
@@ -16,6 +15,8 @@ import logging
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
+from models.counting_checkpoint import OUTPUT_STRIDE
+from utils.counting_model import load_checkpoint, load_backbone_weights
 from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
@@ -32,13 +33,6 @@ def seed_worker(worker_id):
     seed = torch.initial_seed() % (2 ** 32)
     random.seed(seed)
     np.random.seed(seed)
-
-
-def load_checkpoint(path):
-    try:
-        return torch.load(path, map_location='cpu', mmap=True)
-    except TypeError:
-        return torch.load(path, map_location='cpu')
 
 
 def has_dual_dora_adapters(state):
@@ -68,6 +62,8 @@ class RegTrainer(Trainer):
         else:
             raise Exception("gpu is not available")
 
+        if args.downsample_ratio != OUTPUT_STRIDE:
+            raise ValueError('CCTrans Regression requires downsample_ratio=8')
         self.downsample_ratio = args.downsample_ratio
         data_roots = {
             'baseline': {
@@ -111,9 +107,11 @@ class RegTrainer(Trainer):
             raise ValueError('unknown model: {}'.format(args.model_name))
         # A resumed checkpoint already contains the backbone weights.
         use_pretrained = (args.stage == 'baseline' and args.pretrained_backbone
-                          and not args.resume)
+                          and not args.resume and not args.backbone_checkpoint)
         self.model = model_builder(pretrained=use_pretrained,
                                    pretrained_path=args.pretrained_path)
+        if args.stage == 'baseline' and args.backbone_checkpoint:
+            load_backbone_weights(self.model, args.backbone_checkpoint)
         if args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
@@ -277,7 +275,6 @@ class RegTrainer(Trainer):
     def train_eopch(self):
         epoch_loss = AverageMeter()
         epoch_bayesian_loss = AverageMeter()
-        epoch_consistency_loss = AverageMeter()
         epoch_count_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
@@ -302,24 +299,14 @@ class RegTrainer(Trainer):
             targets = [t.to(self.device) for t in targets]
 
             with torch.set_grad_enabled(True):
-                outputs, features = self.model(inputs)
+                outputs = self.model(inputs)
                 prob_list = self.post_prob(points, st_sizes)
                 bayesian_loss = self.criterion(prob_list, targets, outputs)
-                loss_c = outputs.new_zeros(())
-                for layer_features in features:
-                    # [batch, tokens, channels]. Preserve the original sum over
-                    # tokens, but average over the batch so its scale does not
-                    # depend on batch size.
-                    mean_feature = layer_features.mean(dim=1, keepdim=True)
-                    cosine = 1 - F.cosine_similarity(
-                        layer_features, mean_feature, dim=2, eps=1e-5
-                    )
-                    loss_c += cosine.sum(dim=1).mean()
                 # Match Bayesian supervision, including fractional people at
                 # crop boundaries. Keep this computation in the autograd graph.
                 count_loss = count_l1_loss(outputs, targets)
                 weighted_count_loss = self.args.count_loss_weight * count_loss
-                loss = bayesian_loss + loss_c + weighted_count_loss
+                loss = bayesian_loss + weighted_count_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -330,7 +317,6 @@ class RegTrainer(Trainer):
                 res = pre_count - gd_count
                 epoch_loss.update(loss.item(), N)
                 epoch_bayesian_loss.update(bayesian_loss.item(), N)
-                epoch_consistency_loss.update(loss_c.item(), N)
                 epoch_count_loss.update(count_loss.item(), N)
                 epoch_mse.update(np.mean(res * res), N)
                 epoch_mae.update(np.mean(abs(res)), N)
@@ -351,22 +337,17 @@ class RegTrainer(Trainer):
                         bayesian_loss.item(),
                         self.global_step,
                     )
-                    self.writer.add_scalar(
-                        'train_step/consistency_loss',
-                        loss_c.item(),
-                        self.global_step,
-                    )
 
                 if (step == 0 or
                         (step + 1) % self.args.tensorboard_log_interval == 0):
                     logging.info(
                         '%s Epoch %d/%d Step %d/%d Train: '
                         'total_loss=%.4f, bayesian_loss=%.4f, '
-                        'consistency_loss=%.4f, count_loss=%.4f, '
+                        'count_loss=%.4f, '
                         'weighted_count_loss=%.4f',
                         self.args.stage, self.epoch, self.args.max_epoch,
                         step + 1, len(self.dataloaders['train']),
-                        loss.item(), bayesian_loss.item(), loss_c.item(),
+                        loss.item(), bayesian_loss.item(),
                         count_loss.item(), weighted_count_loss.item(),
                         extra={'file_only': True},
                     )
@@ -381,11 +362,6 @@ class RegTrainer(Trainer):
         self.writer.add_scalar('train/total_loss', epoch_loss.get_avg(), self.epoch)
         self.writer.add_scalar(
             'train/bayesian_loss', epoch_bayesian_loss.get_avg(), self.epoch
-        )
-        self.writer.add_scalar(
-            'train/consistency_loss',
-            epoch_consistency_loss.get_avg(),
-            self.epoch,
         )
         self.writer.add_scalar('train/mae', epoch_mae.get_avg(), self.epoch)
         self.writer.add_scalar(
@@ -404,14 +380,13 @@ class RegTrainer(Trainer):
 
         logging.info(
             '{} Epoch {} Train, Loss: {:.4f}, Bayesian Loss: {:.4f}, '
-            'Consistency Loss: {:.4f}, Count L1: {:.4f}, '
+            'Count L1: {:.4f}, '
             'Weighted Count L1: {:.4f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
             .format(
                 self.args.stage,
                 self.epoch,
                 epoch_loss.get_avg(),
                 epoch_bayesian_loss.get_avg(),
-                epoch_consistency_loss.get_avg(),
                 epoch_count_loss.get_avg(),
                 self.args.count_loss_weight * epoch_count_loss.get_avg(),
                 train_rmse,
@@ -427,6 +402,8 @@ class RegTrainer(Trainer):
             'epoch': self.epoch,
             'epoch_index': self.epoch_index,
             'model_name': self.args.model_name,
+            'architecture': self.model.architecture,
+            'output_stride': self.model.output_stride,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
             'count_loss_weight': self.args.count_loss_weight,
@@ -496,11 +473,11 @@ class RegTrainer(Trainer):
                 with torch.set_grad_enabled(False):
                     predicted_count = 0.0
                     for idx, input in enumerate(input_list):
-                        output = self.model(input)[0]
+                        output = self.model(input)
                         predicted_count += torch.sum(output).item()
             else:
                 with torch.set_grad_enabled(False):
-                    outputs = self.model(inputs)[0]
+                    outputs = self.model(inputs)
                     predicted_count = torch.sum(outputs).item()
 
             ground_truth = count[0].item()

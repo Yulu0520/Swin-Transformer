@@ -14,29 +14,31 @@ from utils.regression_trainer_cosine_multibatch import RegTrainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train Swin + MAN')
+    parser = argparse.ArgumentParser(description='Train Swin + CCTrans Regression')
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
-        default='dora1',
+        default='all',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
     parser.add_argument('--dora1-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day/val',
                         help='DoRA1-stage validation directory')
     
-    parser.add_argument('--baseline-checkpoint', default='/home/mmslab-1080/Desktop/lora Swin Transformer/Lora_SwimTrans/model/swin_t_trans/baseline/0923-194302/best_model.pth',
+    parser.add_argument('--baseline-checkpoint', default='',
                         help='trained clean baseline .pth or .tar for DoRA-only training')
-    parser.add_argument('--dora-checkpoint', default='model/swin_t_trans/dora/1002-131742/best_model.pth',
+    parser.add_argument('--backbone-checkpoint', default='',
+                        help='initialize a new baseline from only the Swin weights of a clean baseline (including old MAN models)')
+    parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
                         default='pre_models/swin_large_patch4_window12_384_22k.pth',
@@ -88,15 +90,17 @@ def parse_args():
     parser.add_argument('--tensorboard-log-interval', type=int, default=10,
                         help='batch interval for TensorBoard and train.log loss')
     parser.add_argument('--is-gray', action='store_true')
-    parser.add_argument('--crop-size', type=int, default=384)
-    parser.add_argument('--downsample-ratio', type=int, default=16)
+    parser.add_argument('--crop-size', type=int, default=256)
+    parser.add_argument('--downsample-ratio', type=int, choices=[8], default=8)
     parser.add_argument('--use-background', type=bool, default=True)
     parser.add_argument('--sigma', type=float, default=8.0)
     parser.add_argument('--background-ratio', type=float, default=0.15)
     parser.add_argument('--count-loss-weight', type=float, default=0.1,
-                        help='weight of crop count L1; 0 restores the original objective')
+                        help='weight of crop count L1; 0 uses Bayesian loss only')
     
     args = parser.parse_args()
+    if args.backbone_checkpoint and (args.resume or args.stage not in ('baseline', 'both', 'all')):
+        parser.error('--backbone-checkpoint is for a new baseline, without --resume')
     if not math.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
         parser.error('--count-loss-weight must be finite and nonnegative')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):

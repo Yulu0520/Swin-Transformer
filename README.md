@@ -51,20 +51,63 @@ For arbitrary validation sizes, input is zero-padded on the bottom/right to a
 multiple of 8; the output is `[B, 1, ceil(H/8), ceil(W/8)]`. All output cells
 participate in the predicted count. Training crops must be divisible by 8.
 
-## Loss
+## Loss: DM-Count (CCTrans)
+
+All three stages now use the same objective as the reference CCTrans repo:
 
 ```text
-total = Bayesian + count_loss_weight * count_L1
+total = count_L1 + wot * OT + wtv * TV
 ```
 
-`--count-loss-weight` defaults to 0.1. Bayesian supervision (including background
-and its existing foreground-error selection), sigma and background ratio are
-unchanged. Count L1 compares each crop's density sum with `targets.sum()`,
-including fractional people at crop boundaries, then averages over the batch.
-Empty crops have zero target count. No cosine, OT or TV loss is used.
-`--downsample-ratio` is fixed to 8 in training/testing so the Bayesian probability
-grid matches the new head. TensorBoard logs total, Bayesian, raw/weighted count
-loss, MAE and RMSE; consistency scalars are no longer produced.
+| Setting | Default |
+| --- | ---: |
+| Count L1 weight | 1 (fixed) |
+| `--wot` | 0.1 |
+| `--wtv` | 0.01 |
+| `--reg` (Sinkhorn entropy regularization) | 10.0 |
+| `--num-of-iter-in-ot` | 100 |
+| `--norm-cood` | 0 (input-pixel coordinates; 1 enables [-1, 1]) |
+
+Bayesian/posterior supervision, cosine consistency and fractional crop targets
+are no longer used by the active trainer. `--sigma`, `--background-ratio`,
+`--use-background` and `--count-loss-weight` have been removed. Count L1 now has
+weight **1**, rather than the previous 0.1.
+
+The existing jpg/npy datasets still work. Only the first two annotation columns
+(x, y) are used; a third nearest-neighbor-distance column is ignored. Training
+keeps the existing grayscale, scale, crop and horizontal-flip augmentation,
+but retains only head centers inside each crop. Every retained point counts as
+one person. Empty point arrays are normalized to shape (0, 2).
+
+A discrete map scatters one unit per retained point (duplicates accumulate),
+then sums each 8x8 block to match the stride-8 prediction. No Gaussian smoothing
+or fractional boundary weights are used. Its sum equals the number of retained
+points. Crops use half-open bounds `0 <= x < width`, `0 <= y < height`; rounded
+coordinates are clipped to the final pixel. Flip uses pixel-center coordinates
+and the map is generated after augmentation. These explicit boundary rules
+avoid out-of-crop points and point/map inconsistencies in the reference code.
+
+Training computes `density / (density.sum() + 1e-6)` separately for each image.
+This normalized density is only used for distribution supervision; the model
+continues to return the **raw** density tensor for inference/counting.
+OT matches the predicted distribution to the uniform distribution over head
+points using the reference Sinkhorn solver and detached dual-potential gradient.
+TV is the pixelwise L1 difference between normalized prediction and normalized
+discrete target, multiplied by the crop count; it is not spatial-gradient TV.
+Empty crops skip OT and have zero TV contribution, so count L1 penalizes false
+positives. All loss arithmetic uses FP32.
+
+For parity with CCTrans, **count and TV average over the batch, whereas OT sums
+over images**. Changing batch size changes OT's relative gradient contribution.
+The OT loss scalar is a gradient surrogate and may be near zero or negative;
+its scalar value is not the Wasserstein distance. TensorBoard records raw
+count/OT/TV, weighted OT/TV, total loss, Wasserstein distance, OT dual objective,
+MAE and RMSE. Nonfinite terms stop training with an error instead of silently
+updating corrupted weights. OT increases training time/memory, not inference cost.
+
+The model, Regression initialization, optimizer (Adam), learning rates,
+validation and `2 * RMSE + MAE` checkpoint selection remain unchanged. CCTrans's
+AdamW, patch validation and MAE-only selection are not part of this loss change.
 
 ## Training
 
@@ -78,9 +121,9 @@ python train.py --stage baseline
 python train.py --stage all
 ```
 
-The CLI still defaults to `--stage dora1`, which requires `--dora-checkpoint`
-or `--resume`; a bare `python train.py` does not start a new baseline.
-Defaults otherwise remain unchanged: Swin-T, 384x384 crops, batch size 4,
+The CLI defaults to `--stage all`: a bare `python train.py` runs all three stages.
+Use `--stage baseline` to compare the new loss before training adapters.
+Defaults otherwise remain unchanged: Swin-T, 256x256 crops, batch size 4,
 10 epochs per stage, validation every 5 epochs starting at index 0, baseline
 LR 5e-6, adapter LR 2e-4, and weight decay 1e-5.
 
@@ -127,12 +170,43 @@ and cannot be combined with resume. It also works with a new clean baseline.
 There is no implicit partial loading of an incompatible head.
 
 Epoch `.tar` checkpoints record `architecture=swin_cctrans_regression_v1`,
-`output_stride=8`, model name, stage, optimizer, crop size, count-loss weight,
-and adapter settings. Best `.pth` files remain raw state dicts; head keys and
+`output_stride=8`, model name, stage, optimizer, crop size, `loss_type=dm_count_v1`,
+the complete OT/TV settings and crop-target policy, and adapter settings. Best `.pth` files remain raw state dicts; head keys and
 strict weight shapes verify compatibility. Supply matching adapter rank/alpha
 when loading `.pth`. Resume a new-architecture stage with `--resume file.tar`.
-CLI count-loss weight controls the objective on resume. Best-model selection
-remains `2 * RMSE + MAE`. Output paths remain `model/<model-name>/<stage>/<run>/`.
+Resume requires matching loss type, OT/TV settings, crop size and batch size; it restores
+optimizer, epoch and best metrics. Best-model selection remains `2 * RMSE + MAE`. Output paths remain `model/<model-name>/<stage>/<run>/`.
+
+### Switching from Bayesian training to DM-Count
+
+Existing **Swin + CCTrans Regression** weights remain architecture-compatible.
+To reuse a full baseline (backbone and head) from the previous objective, start
+a fresh experiment with a new optimizer, epoch counter and best metrics:
+
+```bash
+python train.py --stage baseline --model-name swin_t_trans \
+  --init-checkpoint /path/to/previous/baseline/best_model.pth \
+  --save-dir model_dm_count --pretrain-epochs 100 --pretrain-val-epoch 1
+```
+
+`--init-checkpoint` accepts matching-stage `.pth` or `.tar` models, including
+previous Bayesian Regression checkpoints. It cannot be combined with `--resume`
+or `--backbone-checkpoint`. For DoRA/DoRA1 initialization it requires the complete
+dual-adapter state and matching rank/alpha. In a sequential pipeline it applies
+only to the initial baseline; later stages use the newly trained parent.
+Old MAN full-model checkpoints remain incompatible: use the explicit
+`--backbone-checkpoint` option to reuse only their clean Swin weights.
+
+```bash
+# Resume the same DM-Count experiment, preserving its settings.
+python train.py --stage baseline --resume /path/to/dm_count/10_ckpt.tar \
+  --wot 0.1 --wtv 0.01 --reg 10 --num-of-iter-in-ot 100 --norm-cood 0
+```
+
+Previous Bayesian `.tar` files cannot be resumed under a different objective;
+use `--init-checkpoint` instead. Raw `.pth` files are weights only, so they also
+use `--init-checkpoint`, not `--resume`. Model architecture metadata and strict
+weight-shape checks continue to protect against incompatible heads.
 
 ## Evaluation and routing
 
@@ -180,9 +254,11 @@ feature visualizations, not MAN attention maps.
 python -m unittest discover -s tests -v
 ```
 
-The tests cover both backbones, arbitrary image sizes, Bayesian/count-loss
-gradients through every selected stage, frozen adapter-stage BatchNorm, route
-selection, checkpoint compatibility and the existing router/DoRA behavior.
+The tests cover reference CCTrans loss/gradient parity (including OT batch
+reduction), discrete-map mass conservation, augmentations, duplicate/edge/empty
+points, zero/tiny predictions, both backbones, all selected stages' gradients,
+real baseline/adapter training steps, frozen BatchNorm, weight-only migration,
+resume setting checks, checkpoint compatibility and existing routing behavior.
 
 ## Citation
 If you use this code for your research, please cite our paper:

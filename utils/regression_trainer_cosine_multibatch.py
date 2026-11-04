@@ -16,15 +16,13 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
 from models.counting_checkpoint import OUTPUT_STRIDE
-from utils.counting_model import load_checkpoint, load_backbone_weights
+from utils.counting_model import load_checkpoint, load_backbone_weights, load_initial_weights
 from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
 )
 from datasets.crowd import Crowd
-from losses.bay_loss import Bay_Loss
-from losses.count_loss import count_l1_loss
-from losses.post_prob import Post_Prob
+from losses.dm_count import DMCountLoss, LOSS_TYPE, loss_config, validate_resume_loss
 from math import ceil
 import random
 
@@ -44,9 +42,8 @@ def train_collate(batch):
     transposed_batch = list(zip(*batch))
     images = torch.stack(transposed_batch[0], 0)
     points = transposed_batch[1]  # the number of points is not fixed, keep it as a list of tensor
-    targets = transposed_batch[2]
-    st_sizes = torch.FloatTensor(transposed_batch[3])
-    return images, points, targets, st_sizes
+    gt_discretes = torch.stack(transposed_batch[2], 0)
+    return images, points, gt_discretes
 
 
 class RegTrainer(Trainer):
@@ -107,12 +104,17 @@ class RegTrainer(Trainer):
             raise ValueError('unknown model: {}'.format(args.model_name))
         # A resumed checkpoint already contains the backbone weights.
         use_pretrained = (args.stage == 'baseline' and args.pretrained_backbone
-                          and not args.resume and not args.backbone_checkpoint)
+                          and not args.resume and not args.backbone_checkpoint
+                          and not args.init_checkpoint)
         self.model = model_builder(pretrained=use_pretrained,
                                    pretrained_path=args.pretrained_path)
         if args.stage == 'baseline' and args.backbone_checkpoint:
             load_backbone_weights(self.model, args.backbone_checkpoint)
-        if args.stage == 'dora':
+        if args.init_checkpoint:
+            load_initial_weights(self.model, args)
+            logging.info('Initialized model weights from %s; optimizer/epoch/best metrics reset',
+                         args.init_checkpoint)
+        elif args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -201,6 +203,7 @@ class RegTrainer(Trainer):
             suf = args.resume.rsplit('.', 1)[-1]
             if suf == 'tar':
                 checkpoint = load_checkpoint(args.resume)
+                validate_resume_loss(checkpoint, args)
                 resumed_state = checkpoint
                 if checkpoint.get('stage', 'baseline') != args.stage:
                     raise ValueError('Resume checkpoint stage does not match')
@@ -223,17 +226,13 @@ class RegTrainer(Trainer):
                     self.start_epoch = checkpoint['epoch_index'] + 1
                 else:
                     self.start_epoch = checkpoint['epoch'] + 1
-            elif suf == 'pth':
-                self.model.load_state_dict(load_checkpoint(args.resume))
+            else:
+                raise ValueError('--resume requires a .tar; use --init-checkpoint for weights only')
 
-        self.post_prob = Post_Prob(args.sigma,
-                                   args.crop_size,
-                                   args.downsample_ratio,
-                                   args.background_ratio,
-                                   args.use_background,
-                                   self.device)
-        self.criterion = Bay_Loss(args.use_background, self.device)
-        # self.criterion = torch.nn.MSELoss(reduction='sum')
+        self.criterion = DMCountLoss(
+            args.crop_size, args.downsample_ratio, self.device,
+            wot=args.wot, wtv=args.wtv, reg=args.reg,
+            num_of_iter_in_ot=args.num_of_iter_in_ot, norm_cood=bool(args.norm_cood))
         self.save_list = Save_Handle(max_num=args.max_model_num)
         self.best_mae = resumed_state.get('best_mae', np.inf)
         self.best_mse = resumed_state.get('best_mse', np.inf)
@@ -273,127 +272,72 @@ class RegTrainer(Trainer):
             self.writer.close()
 
     def train_eopch(self):
-        epoch_loss = AverageMeter()
-        epoch_bayesian_loss = AverageMeter()
-        epoch_count_loss = AverageMeter()
-        epoch_mae = AverageMeter()
-        epoch_mse = AverageMeter()
+        metric_names = ('total', 'count', 'ot', 'tv', 'weighted_ot',
+                        'weighted_tv', 'wasserstein', 'ot_objective')
+        meters = {name: AverageMeter() for name in metric_names}
+        epoch_mae, epoch_mse = AverageMeter(), AverageMeter()
         epoch_start = time.time()
-        # Adapter stages keep the frozen network's dropout and stochastic
-        # depth in inference mode while gradients update only the active adapter.
+        # Freeze dropout/stochastic depth and head BN statistics in adapter stages.
         self.model.train(self.args.stage == 'baseline')
-
         train_bar = tqdm(
-            enumerate(self.dataloaders['train']),
-            total=len(self.dataloaders['train']),
-            desc='{} {}/{}'.format(
-                self.args.stage.title(), self.epoch, self.args.max_epoch),
-            dynamic_ncols=True,
-            mininterval=0.5,
-        )
-        for step, (inputs, points, targets, st_sizes) in train_bar:
-            inputs = inputs.to(self.device)
-            st_sizes = st_sizes.to(self.device)
-            gd_count = np.array([len(p) for p in points], dtype=np.float32)
+            enumerate(self.dataloaders['train']), total=len(self.dataloaders['train']),
+            desc='{} {}/{}'.format(self.args.stage.title(), self.epoch, self.args.max_epoch),
+            dynamic_ncols=True, mininterval=0.5)
+        for step, (inputs, points, gt_discrete) in train_bar:
+            inputs, gt_discrete = inputs.to(self.device), gt_discrete.to(self.device)
             points = [p.to(self.device) for p in points]
-            targets = [t.to(self.device) for t in targets]
-
+            gd_count = np.array([len(p) for p in points], dtype=np.float32)
             with torch.set_grad_enabled(True):
                 outputs = self.model(inputs)
-                prob_list = self.post_prob(points, st_sizes)
-                bayesian_loss = self.criterion(prob_list, targets, outputs)
-                # Match Bayesian supervision, including fractional people at
-                # crop boundaries. Keep this computation in the autograd graph.
-                count_loss = count_l1_loss(outputs, targets)
-                weighted_count_loss = self.args.count_loss_weight * count_loss
-                loss = bayesian_loss + weighted_count_loss
-
+                terms = self.criterion(outputs, points, gt_discrete)
+                loss = terms['total']
+                if not all(torch.isfinite(value).all() for value in terms.values()):
+                    raise FloatingPointError('Nonfinite DM-Count loss at step {}'.format(step))
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-
-                N = inputs.size(0)
-                pre_count = torch.sum(outputs.view(N, -1), dim=1).detach().cpu().numpy()
-                res = pre_count - gd_count
-                epoch_loss.update(loss.item(), N)
-                epoch_bayesian_loss.update(bayesian_loss.item(), N)
-                epoch_count_loss.update(count_loss.item(), N)
-                epoch_mse.update(np.mean(res * res), N)
-                epoch_mae.update(np.mean(abs(res)), N)
-
-                if self.global_step % self.args.tensorboard_log_interval == 0:
-                    self.writer.add_scalar(
-                        'train_step/count_loss', count_loss.item(), self.global_step
-                    )
-                    self.writer.add_scalar(
-                        'train_step/weighted_count_loss',
-                        weighted_count_loss.item(), self.global_step,
-                    )
-                    self.writer.add_scalar(
-                        'train_step/total_loss', loss.item(), self.global_step
-                    )
-                    self.writer.add_scalar(
-                        'train_step/bayesian_loss',
-                        bayesian_loss.item(),
-                        self.global_step,
-                    )
-
-                if (step == 0 or
-                        (step + 1) % self.args.tensorboard_log_interval == 0):
-                    logging.info(
-                        '%s Epoch %d/%d Step %d/%d Train: '
-                        'total_loss=%.4f, bayesian_loss=%.4f, '
-                        'count_loss=%.4f, '
-                        'weighted_count_loss=%.4f',
-                        self.args.stage, self.epoch, self.args.max_epoch,
-                        step + 1, len(self.dataloaders['train']),
-                        loss.item(), bayesian_loss.item(),
-                        count_loss.item(), weighted_count_loss.item(),
-                        extra={'file_only': True},
-                    )
-
-                train_bar.set_postfix_str(
-                    'loss={:.3f}'.format(loss.item()),
-                    refresh=False,
-                )
-                self.global_step += 1
-
+            batch_size = inputs.size(0)
+            predicted = outputs.flatten(1).sum(1).detach().cpu().numpy()
+            errors = predicted - gd_count
+            epoch_mae.update(np.mean(abs(errors)), batch_size)
+            epoch_mse.update(np.mean(errors * errors), batch_size)
+            values = {name: terms[name].item() for name in metric_names}
+            for name, value in values.items():
+                meters[name].update(value, batch_size)
+            if self.global_step % self.args.tensorboard_log_interval == 0:
+                for name, value in values.items():
+                    tag = name + '_loss' if name not in ('wasserstein', 'ot_objective') else name
+                    self.writer.add_scalar('train_step/' + tag, value, self.global_step)
+            if step == 0 or (step + 1) % self.args.tensorboard_log_interval == 0:
+                logging.info(
+                    '%s Epoch %d/%d Step %d/%d Train: total_loss=%.4f, '
+                    'count_loss=%.4f, ot_loss=%.4f, tv_loss=%.4f, '
+                    'weighted_ot_loss=%.4f, weighted_tv_loss=%.4f, wasserstein=%.4f',
+                    self.args.stage, self.epoch, self.args.max_epoch,
+                    step + 1, len(self.dataloaders['train']), values['total'],
+                    values['count'], values['ot'], values['tv'],
+                    values['weighted_ot'], values['weighted_tv'], values['wasserstein'],
+                    extra={'file_only': True})
+            train_bar.set_postfix(loss='{:.3f}'.format(values['total']),
+                                  count='{:.3f}'.format(values['count']),
+                                  ot='{:.3f}'.format(values['weighted_ot']),
+                                  tv='{:.3f}'.format(values['weighted_tv']), refresh=False)
+            self.global_step += 1
+        for name, meter in meters.items():
+            tag = name + '_loss' if name not in ('wasserstein', 'ot_objective') else name
+            self.writer.add_scalar('train/' + tag, meter.get_avg(), self.epoch)
         train_rmse = np.sqrt(epoch_mse.get_avg())
-        self.writer.add_scalar('train/total_loss', epoch_loss.get_avg(), self.epoch)
-        self.writer.add_scalar(
-            'train/bayesian_loss', epoch_bayesian_loss.get_avg(), self.epoch
-        )
         self.writer.add_scalar('train/mae', epoch_mae.get_avg(), self.epoch)
-        self.writer.add_scalar(
-            'train/count_loss', epoch_count_loss.get_avg(), self.epoch
-        )
-        self.writer.add_scalar(
-            'train/weighted_count_loss',
-            self.args.count_loss_weight * epoch_count_loss.get_avg(), self.epoch,
-        )
-        # Unlike train/mae (len(points)), this uses fractional crop targets.
-        self.writer.add_scalar(
-            'train/crop_count_mae', epoch_count_loss.get_avg(), self.epoch
-        )
+        self.writer.add_scalar('train/crop_count_mae', meters['count'].get_avg(), self.epoch)
         self.writer.add_scalar('train/rmse', train_rmse, self.epoch)
         self.writer.flush()
-
         logging.info(
-            '{} Epoch {} Train, Loss: {:.4f}, Bayesian Loss: {:.4f}, '
-            'Count L1: {:.4f}, '
-            'Weighted Count L1: {:.4f}, RMSE: {:.2f}, MAE: {:.2f}, Cost {:.1f} sec'
-            .format(
-                self.args.stage,
-                self.epoch,
-                epoch_loss.get_avg(),
-                epoch_bayesian_loss.get_avg(),
-                epoch_count_loss.get_avg(),
-                self.args.count_loss_weight * epoch_count_loss.get_avg(),
-                train_rmse,
-                epoch_mae.get_avg(),
-                time.time()-epoch_start,
-            )
-        )
+            '%s Epoch %d Train, Loss: %.4f, Count L1: %.4f, OT: %.4f, TV: %.4f, '
+            'Weighted OT: %.4f, Weighted TV: %.4f, RMSE: %.2f, MAE: %.2f, Cost %.1f sec',
+            self.args.stage, self.epoch, meters['total'].get_avg(),
+            meters['count'].get_avg(), meters['ot'].get_avg(), meters['tv'].get_avg(),
+            meters['weighted_ot'].get_avg(), meters['weighted_tv'].get_avg(),
+            train_rmse, epoch_mae.get_avg(), time.time() - epoch_start)
 
     def save_epoch(self):
         model_state_dic = self.model.state_dict()
@@ -406,7 +350,9 @@ class RegTrainer(Trainer):
             'output_stride': self.model.output_stride,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,
-            'count_loss_weight': self.args.count_loss_weight,
+            'loss_type': LOSS_TYPE,
+            'loss_config': loss_config(self.args),
+            'initial_checkpoint': self.args.init_checkpoint,
             'adapter_type': ({
                 'dora': 'parallel_dora_dora1',
                 'dora1': 'parallel_dora_dora1',

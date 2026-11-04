@@ -38,6 +38,8 @@ def parse_args():
                         help='trained clean baseline .pth or .tar for DoRA-only training')
     parser.add_argument('--backbone-checkpoint', default='',
                         help='initialize a new baseline from only the Swin weights of a clean baseline (including old MAN models)')
+    parser.add_argument('--init-checkpoint', default='',
+                        help='initialize the selected stage from compatible full model weights; reset optimizer, epoch and best metrics (use when switching losses)')
     parser.add_argument('--dora-checkpoint', default='',
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--pretrained-path',
@@ -92,21 +94,28 @@ def parse_args():
     parser.add_argument('--is-gray', action='store_true')
     parser.add_argument('--crop-size', type=int, default=256)
     parser.add_argument('--downsample-ratio', type=int, choices=[8], default=8)
-    parser.add_argument('--use-background', type=bool, default=True)
-    parser.add_argument('--sigma', type=float, default=8.0)
-    parser.add_argument('--background-ratio', type=float, default=0.15)
-    parser.add_argument('--count-loss-weight', type=float, default=0.1,
-                        help='weight of crop count L1; 0 uses Bayesian loss only')
+    parser.add_argument('--wot', type=float, default=0.1, help='OT loss weight')
+    parser.add_argument('--wtv', type=float, default=0.01, help='TV loss weight')
+    parser.add_argument('--reg', type=float, default=10.0, help='Sinkhorn entropy regularization')
+    parser.add_argument('--num-of-iter-in-ot', type=int, default=100, help='maximum Sinkhorn iterations')
+    parser.add_argument('--norm-cood', type=int, choices=[0, 1], default=0,
+                        help='normalize OT coordinates to [-1, 1]; default matches CCTrans')
     
     args = parser.parse_args()
+    if args.init_checkpoint and (args.resume or args.backbone_checkpoint):
+        parser.error('--init-checkpoint cannot be combined with --resume or --backbone-checkpoint')
+    if args.resume and not args.resume.endswith('.tar'):
+        parser.error('--resume requires an epoch .tar; use --init-checkpoint for weights only')
     if args.backbone_checkpoint and (args.resume or args.stage not in ('baseline', 'both', 'all')):
         parser.error('--backbone-checkpoint is for a new baseline, without --resume')
-    if not math.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
-        parser.error('--count-loss-weight must be finite and nonnegative')
-    if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
-        parser.error('--stage dora needs --baseline-checkpoint or --resume')
-    if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume):
-        parser.error('--stage dora1 needs --dora-checkpoint or --resume')
+    if any(not math.isfinite(value) or value < 0 for value in (args.wot, args.wtv)):
+        parser.error('--wot and --wtv must be finite and nonnegative')
+    if not math.isfinite(args.reg) or args.reg <= 0 or args.num_of_iter_in_ot <= 0:
+        parser.error('--reg and --num-of-iter-in-ot must be positive')
+    if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume or args.init_checkpoint):
+        parser.error('--stage dora needs --baseline-checkpoint, --init-checkpoint or --resume')
+    if args.stage == 'dora1' and not (args.dora_checkpoint or args.resume or args.init_checkpoint):
+        parser.error('--stage dora1 needs --dora-checkpoint, --init-checkpoint or --resume')
     if args.stage in ('both', 'all') and args.dora_checkpoint:
         parser.error('pipeline stages use their newly trained DoRA checkpoint; '
                      'do not pass --dora-checkpoint')
@@ -175,6 +184,7 @@ def run_stage(args, stage, parent_checkpoint=''):
         elif stage == 'dora1':
             stage_args.dora_checkpoint = parent_checkpoint
         stage_args.resume = ''
+        stage_args.init_checkpoint = ''
     seed_everything(stage_args.seed)
     trainer = RegTrainer(stage_args)
     trainer.setup()

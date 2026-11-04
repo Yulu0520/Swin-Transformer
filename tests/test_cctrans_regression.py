@@ -1,4 +1,4 @@
-"""Integration checks for multiscale regression, Bayesian training and routing."""
+"""Integration checks for multiscale regression, DM-Count training and routing."""
 
 import math
 import tempfile
@@ -10,9 +10,8 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from losses.bay_loss import Bay_Loss
-from losses.count_loss import count_l1_loss
-from losses.post_prob import Post_Prob
+from losses.dm_count import DMCountLoss, LOSS_TYPE, validate_resume_loss
+from datasets.crowd import gen_discrete_map
 from models.counting_checkpoint import (
     ARCHITECTURE, OUTPUT_STRIDE, validate_counting_checkpoint,
 )
@@ -59,7 +58,7 @@ class CCTransRegressionTest(unittest.TestCase):
         self.assertEqual(output.shape, (1, 1, 9, 11))
         self.assertTrue(torch.isfinite(output).all())
 
-    def test_bayesian_and_fractional_count_loss_reach_all_stages_and_head(self):
+    def test_dm_count_loss_reaches_all_stages_and_head(self):
         model = swin_t_trans(pretrained=False).train()
         with torch.no_grad():
             model.regression.res[3].bias.fill_(0.1)
@@ -68,11 +67,9 @@ class CCTransRegressionTest(unittest.TestCase):
             stage.retain_grad()
         output = model.regression(*stages)
         points = [torch.tensor([[24., 28.], [50., 50.]]), torch.empty(0, 2)]
-        targets = [torch.tensor([1., 0.4]), torch.empty(0)]
-        post = Post_Prob(8., 64, 8, 0.15, True, torch.device('cpu'))
-        bayesian = Bay_Loss(True, torch.device('cpu'))(post(points, torch.tensor([64., 64.])),
-                                                     targets, output)
-        loss = bayesian + 0.1 * count_l1_loss(output, targets)
+        discrete = torch.stack([torch.from_numpy(gen_discrete_map(64, 64, p.numpy()))
+                                for p in points])
+        loss = DMCountLoss(64, 8, torch.device('cpu'))(output, points, discrete)['total']
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         for stage in stages:
@@ -168,26 +165,28 @@ class CCTransRegressionTest(unittest.TestCase):
             model.regression.res[3].bias.fill_(0.1)
         inputs = torch.randn(2, 3, 64, 64)
         points = [torch.tensor([[24., 28.]]), torch.empty(0, 2)]
-        targets = [torch.tensor([0.4]), torch.empty(0)]
+        discrete = torch.stack([torch.from_numpy(gen_discrete_map(64, 64, p.numpy()))
+                                for p in points])
         trainer = object.__new__(RegTrainer)
         trainer.model = model
         trainer.device = torch.device('cpu')
         trainer.args = SimpleNamespace(stage='baseline', max_epoch=1,
-            tensorboard_log_interval=1, count_loss_weight=0.1,
+            tensorboard_log_interval=1, wot=0.1, wtv=0.01, reg=10.,
+            num_of_iter_in_ot=100, norm_cood=0, downsample_ratio=8, init_checkpoint='', batch_size=2,
             model_name='swin_t_trans', crop_size=64, dora_rank=4, dora_alpha=4.,
             dora1_rank=4, dora1_alpha=4., dora_checkpoint='', seed=42,
             dual_route='dora1')
         trainer.epoch, trainer.epoch_index, trainer.global_step = 1, 0, 0
-        trainer.dataloaders = {'train': [(inputs, points, targets, torch.tensor([64., 64.]))]}
-        trainer.post_prob = Post_Prob(8., 64, 8, 0.15, True, trainer.device)
-        trainer.criterion = Bay_Loss(True, trainer.device)
+        trainer.dataloaders = {'train': [(inputs, points, discrete)]}
+        trainer.criterion = DMCountLoss(64, 8, trainer.device)
         trainer.writer = unittest.mock.Mock()
         trainer.optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
         trainer.train_eopch()
         scalars = {call.args[0]: call.args[1] for call in trainer.writer.add_scalar.call_args_list}
         self.assertAlmostEqual(scalars['train/total_loss'],
-            scalars['train/bayesian_loss'] + scalars['train/weighted_count_loss'], places=4)
-        self.assertFalse(any('consistency' in key for key in scalars))
+            scalars['train/count_loss'] + scalars['train/weighted_ot_loss']
+            + scalars['train/weighted_tv_loss'], places=4)
+        self.assertFalse(any('consistency' in key or 'bayesian' in key for key in scalars))
         for route in ['dora', 'dora1']:
             if route == 'dora':
                 model.enable_dual_dora(active_route=route, trainable_route=route)
@@ -217,6 +216,8 @@ class CCTransRegressionTest(unittest.TestCase):
             self.assertEqual(saved['architecture'], ARCHITECTURE)
             self.assertEqual(saved['output_stride'], 8)
             self.assertEqual(saved['stage'], 'dora1')
+            self.assertEqual(saved['loss_type'], LOSS_TYPE)
+            validate_resume_loss(saved, trainer.args)
             restored = build_dual_dora_model(trainer.args, str(Path(directory) / '1_ckpt.tar')).eval()
             with torch.inference_mode():
                 torch.testing.assert_close(model(inputs), restored(inputs))

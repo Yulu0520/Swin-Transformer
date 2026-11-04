@@ -25,6 +25,27 @@ def load_checkpoint(path):
     return validate_counting_checkpoint(read_checkpoint(path))
 
 
+def load_initial_weights(model, args):
+    """Load a same-stage model for a new objective, without training state."""
+    checkpoint = load_checkpoint(args.init_checkpoint)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    if 'model_state_dict' in checkpoint:
+        if checkpoint.get('model_name') != args.model_name or checkpoint.get('stage') != args.stage:
+            raise ValueError('--init-checkpoint must match the selected model and stage')
+        if args.stage in ('dora', 'dora1'):
+            for name in ('dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
+                if checkpoint.get(name) != getattr(args, name):
+                    raise ValueError('--init-checkpoint adapter settings do not match')
+    if args.stage in ('dora', 'dora1'):
+        if not any('.parametrizations.weight.0.dora1.' in key for key in state):
+            raise ValueError('Adapter --init-checkpoint requires complete dual DoRA weights; '
+                             'use the parent checkpoint option to start a new adapter')
+        model.enable_dual_dora(
+            args.dora_rank, args.dora_alpha, args.dora1_rank, args.dora1_alpha,
+            active_route=args.stage, trainable_route=args.stage)
+    model.load_state_dict(state)
+
+
 def load_backbone_weights(model, path):
     """Explicitly reuse only a clean Swin backbone, including old MAN baselines."""
     checkpoint = read_checkpoint(path)

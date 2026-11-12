@@ -130,3 +130,25 @@ class Crowd(data.Dataset):
         discrete = gen_discrete_map(h, w, keypoints, self.d_ratio)
         return (self.trans(img), torch.from_numpy(keypoints.copy()).float(),
                 torch.from_numpy(discrete.copy()).float())
+
+
+class RoutedCrowd(Crowd):
+    """Mix crops plus a separate original-image router input and filename."""
+
+    def __init__(self, *args, router_mode='classifier', **kwargs):
+        super().__init__(*args, **kwargs)
+        from .day_night import build_router_transform
+        self.router_transform = (build_router_transform(training=False)
+                                 if router_mode == 'classifier' else None)
+
+    def __getitem__(self, item):
+        img_path = self.im_list[item]
+        with Image.open(img_path) as image:
+            img = image.convert('RGB')
+        # Build this before train_transform can crop, resize, flip or grayscale.
+        router_input = self.router_transform(img) if self.router_transform else torch.empty(0)
+        points = load_points(os.path.splitext(img_path)[0] + '.npy')
+        name = os.path.splitext(os.path.basename(img_path))[0]
+        if self.method == 'train':
+            return (*self.train_transform(img, points), router_input, name)
+        return self.trans(img), len(points), name, router_input

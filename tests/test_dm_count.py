@@ -106,8 +106,39 @@ class DMCountLossTest(unittest.TestCase):
         terms['total'].backward()
         torch.testing.assert_close(density.grad, torch.ones_like(density))
 
+    def test_count_weight_scales_only_count_values_and_gradients(self):
+        density = torch.tensor([[[[.2, .4], [.1, .3]]],
+                                [[[.3, .1], [.6, .2]]]], requires_grad=True)
+        points = [torch.tensor([[3., 3.], [11., 11.]]), torch.empty(0, 2)]
+        target = torch.tensor([[[[1., 0.], [0., 1.]]], [[[0., 0.], [0., 0.]]]])
+        baseline = DMCountLoss(16, 8, 'cpu')(density, points, target)
+        baseline_grad = torch.autograd.grad(baseline['total'], density, retain_graph=True)[0]
+        count_grad = torch.autograd.grad(baseline['count'], density)[0]
+        for weight in (0., .25, 1., 2.):
+            with self.subTest(weight=weight):
+                prediction = density.detach().clone().requires_grad_()
+                terms = DMCountLoss(16, 8, 'cpu', count_loss_weight=weight)(prediction, points, target)
+                for name in ('count', 'ot', 'tv', 'weighted_ot', 'weighted_tv'):
+                    torch.testing.assert_close(terms[name], baseline[name])
+                torch.testing.assert_close(terms['weighted_count'], weight * baseline['count'])
+                torch.testing.assert_close(terms['total'],
+                    terms['weighted_count'] + terms['weighted_ot'] + terms['weighted_tv'])
+                terms['total'].backward()
+                torch.testing.assert_close(prediction.grad, baseline_grad + (weight - 1.) * count_grad)
+
+    def test_zero_count_weight_removes_empty_crop_penalty(self):
+        density = torch.ones(1, 1, 2, 2, requires_grad=True)
+        terms = DMCountLoss(16, 8, 'cpu', count_loss_weight=0.)(
+            density, [torch.empty(0, 2)], torch.zeros_like(density))
+        self.assertEqual(terms['count'].item(), 4.)
+        self.assertEqual(terms['weighted_count'].item(), 0.)
+        self.assertEqual(terms['total'].item(), 0.)
+        terms['total'].backward()
+        torch.testing.assert_close(density.grad, torch.zeros_like(density))
+
     def test_rejects_wrong_shapes_and_invalid_hyperparameters(self):
-        for kwargs in [dict(wot=-1.), dict(wtv=float('nan')), dict(reg=0.),
+        for kwargs in [dict(count_loss_weight=-1.), dict(count_loss_weight=float('nan')),
+                       dict(count_loss_weight=float('inf')), dict(wot=-1.), dict(wtv=float('nan')), dict(reg=0.),
                        dict(num_of_iter_in_ot=0)]:
             with self.assertRaises(ValueError):
                 DMCountLoss(16, 8, torch.device('cpu'), **kwargs)
@@ -174,7 +205,8 @@ class DMCountMigrationTest(unittest.TestCase):
         args = settings()
         checkpoint = dict(loss_type=LOSS_TYPE, loss_config=loss_config(args))
         validate_resume_loss(checkpoint, args)
-        for key, value in [('wot', .2), ('wtv', .02), ('reg', 5.),
+        self.assertEqual(checkpoint['loss_config']['count_weight'], 1.)
+        for key, value in [('count_loss_weight', .5), ('wot', .2), ('wtv', .02), ('reg', 5.),
                            ('num_of_iter_in_ot', 50), ('norm_cood', 1), ('crop_size', 32), ('batch_size', 4)]:
             changed = copy.copy(args)
             setattr(changed, key, value)
@@ -188,7 +220,8 @@ class DMCountMigrationTest(unittest.TestCase):
         with patch('sys.argv', ['train.py', '--stage', 'all', '--init-checkpoint', 'old.pth']):
             args = train.parse_args()
         self.assertEqual((args.wot, args.wtv, args.reg, args.num_of_iter_in_ot, args.norm_cood),
-                         (0.1, 0.01, 10., 100, 0))
+                         (0.01, 0.01, 10., 100, 0))
+        self.assertEqual(args.count_loss_weight, 1.)
         with patch('train.RegTrainer') as trainer:
             trainer.return_value.best_model_path = 'new.pth'
             train.run_stage(args, 'baseline')
@@ -198,13 +231,27 @@ class DMCountMigrationTest(unittest.TestCase):
             self.assertEqual(stage_args.init_checkpoint, '')
             self.assertEqual(stage_args.baseline_checkpoint, 'new_baseline.pth')
         for flags in [['--wot', '-1'], ['--wtv', 'nan'], ['--reg', '0'],
-                      ['--num-of-iter-in-ot', '0'], ['--count-loss-weight', '0.1'],
+                      ['--num-of-iter-in-ot', '0'], ['--count-loss-weight', '-0.1'],
+                      ['--count-loss-weight', 'nan'], ['--count-loss-weight', 'inf'],
                       ['--resume', 'old.pth'], ['--resume', 'old.tar', '--init-checkpoint', 'old.pth']]:
             with self.subTest(flags=flags), patch('sys.argv', ['train.py', '--stage', 'baseline'] + flags), \
                  patch('sys.stderr'):
                 with self.assertRaises(SystemExit) as error:
                     train.parse_args()
                 self.assertEqual(error.exception.code, 2)
+
+    def test_custom_count_weight_reaches_each_stage_and_resume_config(self):
+        import train
+        for weight in (0., .5, 2.):
+            with patch('sys.argv', ['train.py', '--count-loss-weight', str(weight)]):
+                args = train.parse_args()
+            self.assertEqual(loss_config(args)['count_weight'], weight)
+            validate_resume_loss(dict(loss_type=LOSS_TYPE, loss_config=loss_config(args)), args)
+            with patch('train.RegTrainer') as trainer:
+                trainer.return_value.best_model_path = 'weights.pth'
+                for stage in ('baseline', 'dora', 'dora1', 'finetune'):
+                    train.run_stage(args, stage)
+                    self.assertEqual(trainer.call_args.args[0].count_loss_weight, weight)
 
     def test_weights_only_migration_loads_head_and_selected_adapter(self):
         torch.manual_seed(2)

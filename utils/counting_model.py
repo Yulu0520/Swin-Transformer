@@ -4,6 +4,7 @@ import glob
 import os
 
 import torch
+from utils.topk_checkpoint import best_ranked_path
 
 from models import swin_c_multibatch as models
 from models.counting_checkpoint import validate_counting_checkpoint
@@ -22,6 +23,8 @@ def read_checkpoint(path):
 
 
 def load_checkpoint(path):
+    if os.path.isdir(path):
+        path = best_ranked_path(path)
     return validate_counting_checkpoint(read_checkpoint(path))
 
 
@@ -65,18 +68,27 @@ def load_backbone_weights(model, path):
 
 def resolve_checkpoint(explicit_path, checkpoint_root, model_name, stage):
     if explicit_path:
+        if os.path.isdir(explicit_path):
+            return best_ranked_path(explicit_path)
         if not os.path.isfile(explicit_path):
             raise FileNotFoundError('Checkpoint not found: {}'.format(explicit_path))
         return explicit_path
 
-    pattern = os.path.join(
-        checkpoint_root, model_name, stage, '*', 'best_model*.pth')
-    candidates = glob.glob(pattern)
-    if not candidates:
-        raise FileNotFoundError(
-            'No default {} checkpoint matched {}; provide --{}-checkpoint'.format(
-                stage, pattern, stage))
-    return max(candidates, key=os.path.getmtime)
+    root = os.path.join(checkpoint_root, model_name, stage)
+    # Timestamp run names sort chronologically. Select rank 1 within the most
+    # recent run by its manifest, never by weight-file modification time/rounded MAE.
+    for run in sorted(glob.glob(os.path.join(root, '*')), reverse=True):
+        if not os.path.isdir(run):
+            continue
+        if os.path.isfile(os.path.join(run, 'rankings.json')):
+            return best_ranked_path(run)
+        legacy = glob.glob(os.path.join(run, 'best_model*.pth'))
+        if len(legacy) == 1:
+            return legacy[0]
+        if len(legacy) > 1:
+            raise ValueError('Multiple legacy weights without ranking metadata in {}; '
+                             'specify an exact checkpoint'.format(run))
+    raise FileNotFoundError('No ranked {} weights under {}; provide --{}-checkpoint'.format(stage, root, stage))
 
 
 def build_model(args, checkpoint_path, expect_dora):
@@ -151,8 +163,8 @@ def build_dual_dora_model(args, checkpoint_path):
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
                 '{} model name does not match --model-name'.format(checkpoint_path))
-        if checkpoint.get('stage') != 'dora1':
-            raise ValueError('{} is not a DoRA1-stage checkpoint'.format(
+        if checkpoint.get('stage') not in ('dora1', 'finetune'):
+            raise ValueError('{} is not a DoRA1/finetune-stage checkpoint'.format(
                 checkpoint_path))
         if checkpoint.get('adapter_type') != 'parallel_dora_dora1':
             raise ValueError('{} is not a DoRA+DoRA1 checkpoint'.format(
@@ -188,5 +200,25 @@ def build_dual_dora_model(args, checkpoint_path):
     model.load_state_dict(state)
     model.set_adapter_route(args.dual_route)
     return model
+
+
+def load_finetune_weights(model, args, path, expected_stage='dora1'):
+    """Attach both frozen adapters and load a complete DoRA1 (or resume) model."""
+    checkpoint = load_checkpoint(path)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    if 'model_state_dict' in checkpoint:
+        if checkpoint.get('stage') != expected_stage or checkpoint.get('model_name') != args.model_name:
+            raise ValueError('Fine-tune checkpoint model/stage does not match')
+        for name in ('dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
+            if checkpoint.get(name) != getattr(args, name):
+                raise ValueError('Fine-tune checkpoint adapter settings do not match')
+    markers = ('dora_A_q', 'dora_B_q', 'dora_A_v', 'dora_B_v', 'magnitude_q', 'magnitude_v')
+    if not all(any('.{}.{}'.format(branch, marker) in key for key in state)
+               for branch in ('dora', 'dora1') for marker in markers):
+        raise ValueError('Fine-tuning requires complete DoRA + DoRA1 weights')
+    model.enable_dual_dora(args.dora_rank, args.dora_alpha,
+                           args.dora1_rank, args.dora1_alpha, active_route='dora1')
+    model.load_state_dict(state)
+    return checkpoint
 
 

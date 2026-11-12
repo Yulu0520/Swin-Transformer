@@ -53,16 +53,16 @@ participate in the predicted count. Training crops must be divisible by 8.
 
 ## Loss: DM-Count (CCTrans)
 
-All three stages now use the same objective as the reference CCTrans repo:
+All stages use the same objective form as the reference CCTrans repo:
 
 ```text
-total = count_L1 + wot * OT + wtv * TV
+total = count_loss_weight * count_L1 + wot * OT + wtv * TV
 ```
 
 | Setting | Default |
 | --- | ---: |
-| Count L1 weight | 1 (fixed) |
-| `--wot` | 0.1 |
+| `--count-loss-weight` | 1.0 |
+| `--wot` | 0.01 |
 | `--wtv` | 0.01 |
 | `--reg` (Sinkhorn entropy regularization) | 10.0 |
 | `--num-of-iter-in-ot` | 100 |
@@ -70,8 +70,21 @@ total = count_L1 + wot * OT + wtv * TV
 
 Bayesian/posterior supervision, cosine consistency and fractional crop targets
 are no longer used by the active trainer. `--sigma`, `--background-ratio`,
-`--use-background` and `--count-loss-weight` have been removed. Count L1 now has
-weight **1**, rather than the previous 0.1.
+`--use-background` have been removed. Count L1 defaults to weight **1**.
+Use `--count-loss-weight 0.5`, for example, to halve its contribution while
+keeping OT/TV weights unchanged. The value must be finite and nonnegative;
+zero disables Count L1's contribution. It applies to baseline, DoRA, DoRA1
+and fine-tuning; a sequential run shares this setting across stages.
+
+```bash
+python train.py --stage baseline --count-loss-weight 0.5
+```
+
+TensorBoard and training logs record both raw `count_loss` and
+`weighted_count_loss`; raw count MAE remains unweighted. Resume requires the
+same count weight, stored as `loss_config.count_weight` in `.tar` checkpoints.
+Existing DM-Count checkpoints with count weight 1 remain compatible with the
+default. `test.py` and validation MAE/RMSE/checkpoint ranking are unchanged.
 
 The existing jpg/npy datasets still work. Only the first two annotation columns
 (x, y) are used; a third nearest-neighbor-distance column is ignored. Training
@@ -111,8 +124,7 @@ AdamW, patch validation and MAE-only selection are not part of this loss change.
 
 ## Training
 
-Install dependencies with `pip install -r requirements.txt`. Training retains
-the single-GPU requirement. Start by training a new baseline:
+Install dependencies with `pip install -r requirements.txt`. Training uses a single GPU by default; `--device cpu` is also available for smoke tests. Start by training a new baseline:
 
 ```bash
 python train.py --stage baseline
@@ -132,6 +144,7 @@ LR 5e-6, adapter LR 2e-4, and weight decay 1e-5.
 | baseline | `SHA/day/train` | `SHA/day/val` | Swin + complete Regression head |
 | dora | `SHA/night/train` | `SHA/night/val` | DoRA Q/V direction and magnitude |
 | dora1 | `SHA/night/train` | `SHA/day/val` | DoRA1 Q/V direction and magnitude |
+| finetune | `SHA/mix/train` | `SHA/mix/val` | Complete shared Regression head only |
 
 The CLI paths point under `/home/mmslab-1080/Desktop/img2img-turbo/`;
 override them with `--data-dir`, `--dora-train-dir`, `--dora-val-dir`,
@@ -140,8 +153,8 @@ matching npy point annotations. The DoRA1 training split remains night even
 though the inference day route selects DoRA1.
 
 ```bash
-python train.py --stage dora --baseline-checkpoint /path/to/NEW/baseline/best_model.pth
-python train.py --stage dora1 --dora-checkpoint /path/to/NEW/dora/best_model.pth
+python train.py --stage dora --baseline-checkpoint /path/to/NEW/baseline/run_directory
+python train.py --stage dora1 --dora-checkpoint /path/to/NEW/dora/run_directory
 ```
 
 Both adapters read the same frozen baseline weights and are mutually exclusive.
@@ -153,6 +166,77 @@ gradients. The new head, including BatchNorm running statistics, stays frozen.
 Swin-T uses torchvision ImageNet-1K pretraining. Swin-L reads the official
 ImageNet-22K `pre_models/swin_large_patch4_window12_384_22k.pth`, or
 `--pretrained-path`. `--no-pretrained-backbone` disables ImageNet initialization.
+
+### Mix head fine-tuning (fourth stage)
+
+After training baseline, DoRA and DoRA1, fine-tune the complete shared Regression
+head on mix images. Swin (including LayerNorm), both adapters and the trained
+router remain frozen. Regression BatchNorm running means/variances remain
+frozen; its affine weights/biases are trainable. The loss stays
+`count_L1 + 0.01 * OT + 0.01 * TV` unless you explicitly override its weights.
+
+For each original RGB image, the frozen router first selects day (DoRA1) or
+night (DoRA). Its separate 224x224 input is made before counting augmentation.
+Only the selected backbone branch runs for that image. Within a batch, images
+are grouped by branch to extract frozen stage-2/3/4 features, then restored to
+the original order for one shared Regression forward and the usual batch loss.
+Filename routing is optional: `night_` selects DoRA, other names select DoRA1.
+
+```bash
+# Start from a completed DoRA1 run (contains both trained adapters).
+python train.py --stage finetune \
+  --finetune-checkpoint /path/to/dora1/run_directory \
+  --router-checkpoint /path/to/router/best_model.pth \
+  --finetune-train-dir /path/to/SHA/mix/train \
+  --finetune-val-dir /path/to/SHA/mix/val
+
+# Run all four stages; the best-ranked weights feed the next stage.
+python train.py --stage all --finetune-after-all \
+  --router-checkpoint /path/to/router/best_model.pth
+
+# Alternative: filename decisions, with no classifier checkpoint required.
+python train.py --stage finetune \
+  --finetune-checkpoint /path/to/dora1/run_directory \
+  --finetune-router-mode filename
+```
+
+Defaults: Adam, 50 epochs, starting LR `1e-7`, linear warmup for 5 epochs to
+`1e-6`, then cosine decay toward `1e-8`. Flags are `--finetune-epochs`,
+`--finetune-start-lr`, `--finetune-lr`, `--finetune-min-lr`, and
+`--finetune-warmup-epochs`. Zero warmup starts directly at the peak LR.
+Validation runs before any updates (epoch 0) and after every epoch, reporting
+mix overall/day/night MAE and RMSE, route counts, and router accuracy against
+filename labels. These labels are diagnostic; classifier decisions use pixels.
+The untouched epoch-0 weights are eligible for the top five.
+
+`--stage all` without `--finetune-after-all` still runs the original three stages.
+To resume fine-tuning, use `--stage finetune --resume /path/to/N_ckpt.tar`
+with the same data, routing mode/checkpoint, adapter settings, loss settings and
+complete LR schedule. The router file content is checked by SHA256. Resume
+restores optimizer, scheduler, epoch and top-five rankings; the initial
+validation is not repeated. Changing these settings requires a fresh run.
+
+### Top-five checkpoint policy
+
+Every stage retains up to five validation checkpoints ranked by
+`score = MAE + 2 * RMSE` (smaller is better), including candidates that are not
+new records. Filenames are `MAE70.14_epoch120.pth`; displayed MAE is rounded,
+but `rankings.json` stores full-precision MAE/RMSE/score. Ties prefer smaller
+MAE, RMSE, then earlier epoch. These `.pth` files contain complete model weights.
+New runs use ranked filenames rather than a `best_model.pth` alias.
+
+Pass a run directory wherever a counting checkpoint is accepted to select its
+rank-1 entry. Sequential training does the same automatically. With no explicit
+checkpoint, evaluation resolves the newest run directory under
+`model/<model-name>/<stage>/` and reads its ranking; it does not rank weight-file
+modification times. Explicit legacy `best_model.pth` paths still work.
+
+Epoch `N_ckpt.tar` files are separate resume snapshots. `--max-model-num`
+(default 1) controls only their retention, independently of the five weights;
+`--save-all` is retained as a deprecated no-op. Resume copies/hardlinks retained
+ranked weights into the new run directory, so keep the source run alongside its
+latest `.tar`. Missing ranked files produce an error instead of silently losing
+candidates. Legacy resume files can restore their single recorded best weight.
 
 ### Checkpoints and migration
 
@@ -175,7 +259,7 @@ the complete OT/TV settings and crop-target policy, and adapter settings. Best `
 strict weight shapes verify compatibility. Supply matching adapter rank/alpha
 when loading `.pth`. Resume a new-architecture stage with `--resume file.tar`.
 Resume requires matching loss type, OT/TV settings, crop size and batch size; it restores
-optimizer, epoch and best metrics. Best-model selection remains `2 * RMSE + MAE`. Output paths remain `model/<model-name>/<stage>/<run>/`.
+optimizer, epoch and best metrics, plus the saved top-five candidates when available. Best-model selection remains `2 * RMSE + MAE`. Output paths remain `model/<model-name>/<stage>/<run>/`.
 
 ### Switching from Bayesian training to DM-Count
 
@@ -200,7 +284,7 @@ Old MAN full-model checkpoints remain incompatible: use the explicit
 ```bash
 # Resume the same DM-Count experiment, preserving its settings.
 python train.py --stage baseline --resume /path/to/dm_count/10_ckpt.tar \
-  --wot 0.1 --wtv 0.01 --reg 10 --num-of-iter-in-ot 100 --norm-cood 0
+  --wot 0.01 --wtv 0.01 --reg 10 --num-of-iter-in-ot 100 --norm-cood 0
 ```
 
 Previous Bayesian `.tar` files cannot be resumed under a different objective;
@@ -225,16 +309,44 @@ python test.py --router-mode filename --domains mix \
   --dora1-checkpoint /path/to/NEW/dora1/best_model.pth
 ```
 
-For a fixed-route comparison, set `--router-mode fixed` and supply new baseline,
-DoRA and optional DoRA1 checkpoints. MAE/RMSE and per-image routing CSV formats
-are unchanged. Images at least 3584 pixels on either axis are split as before;
-counts from the non-overlapping patches are summed. The old hardcoded default
-counting-checkpoint path must be overridden with your new checkpoint.
+Fine-tuned checkpoints accept the same classifier, filename and fixed routing.
+To compare before/after head fine-tuning with the same router:
+
+```bash
+python test.py --router-mode classifier --domains mix --split val \
+  --data-root /path/to/SHA \
+  --dora1-checkpoint /path/to/dora1/run_directory \
+  --finetune-checkpoint /path/to/finetune/run_directory \
+  --router-checkpoint /path/to/router/best_model.pth
+
+# Evaluate only the best fine-tuned weights using filenames.
+python test.py --router-mode filename --domains mix \
+  --finetune-checkpoint /path/to/finetune/run_directory
+
+# Fixed route, without requiring baseline/DoRA checkpoints.
+python test.py --router-mode fixed --dual-route dora1 --domains mix \
+  --finetune-checkpoint /path/to/finetune/run_directory
+```
+
+Use `--checkpoint-stage finetune` for automatic discovery of the newest
+fine-tune run when omitting an explicit path. `.pth`, `.tar` and ranked run
+directories are accepted. Pass matching `--model-name` and adapter rank/alpha.
+The router is loaded separately and remains frozen; use the same router as in
+training. A raw weight file does not include its training configuration.
+
+`test_results.csv` includes `subset=overall/day/night` for mix, with separate
+model labels for before/after comparisons. `routing_results.csv` records each
+image's selected branch, confidence, expected/detected domain, ground-truth
+count, predicted count and error, plus its model label. Day/night subsets use
+filename labels, not the router's prediction. For a fixed-route comparison of
+baseline/DoRA/DoRA1, supply their respective checkpoint flags as before.
+Images at least 3584 pixels on either axis use non-overlapping patches with
+summed counts; routing is chosen once per original image, before patching.
 
 ## Visualization
 
 Both tools accept `--model-name`, adapter rank/alpha, `--dual-route`, `.pth`/`.tar`
-checkpoints, and `--device cpu` (or a GPU index).
+checkpoints or ranked run directories (including fine-tuned models), and `--device cpu` (or a GPU index).
 
 ```bash
 python save_density_and_var.py --data-dir /path/to/val \
@@ -259,6 +371,9 @@ reduction), discrete-map mass conservation, augmentations, duplicate/edge/empty
 points, zero/tiny predictions, both backbones, all selected stages' gradients,
 real baseline/adapter training steps, frozen BatchNorm, weight-only migration,
 resume setting checks, checkpoint compatibility and existing routing behavior.
+Fine-tuning tests also cover grouped branch order, frozen backbone/BN state,
+LR schedule restoration, real CPU training/resume, epoch-0 retention and top-five
+selection using full-precision scores.
 
 ## Citation
 If you use this code for your research, please cite our paper:

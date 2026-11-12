@@ -1,4 +1,4 @@
-"""CCTrans's DM-Count objective: count MAE + weighted OT + weighted TV."""
+"""CCTrans's DM-Count objective with configurable count, OT and TV weights."""
 
 import math
 
@@ -17,7 +17,8 @@ def loss_config(args):
     return dict(wot=args.wot, wtv=args.wtv, reg=args.reg,
                 num_of_iter_in_ot=args.num_of_iter_in_ot,
                 norm_cood=bool(args.norm_cood), crop_size=args.crop_size,
-                output_stride=args.downsample_ratio, count_weight=1.0,
+                output_stride=args.downsample_ratio,
+                count_weight=getattr(args, 'count_loss_weight', 1.0),
                 ot_reduction='sum', batch_size=args.batch_size, target_policy=TARGET_POLICY)
 
 
@@ -40,16 +41,18 @@ class DMCountLoss(nn.Module):
     """
 
     def __init__(self, crop_size, stride, device, wot=0.1, wtv=0.01,
-                 reg=10.0, num_of_iter_in_ot=100, norm_cood=False):
+                 reg=10.0, num_of_iter_in_ot=100, norm_cood=False,
+                 count_loss_weight=1.0):
         super().__init__()
         if crop_size <= 0 or stride <= 0 or crop_size % stride:
             raise ValueError('crop_size must be positive and divisible by stride')
-        if any(not math.isfinite(value) or value < 0 for value in (wot, wtv)):
-            raise ValueError('OT/TV weights must be finite and nonnegative')
+        if any(not math.isfinite(value) or value < 0 for value in (count_loss_weight, wot, wtv)):
+            raise ValueError('Count/OT/TV weights must be finite and nonnegative')
         if not math.isfinite(reg) or reg <= 0 or num_of_iter_in_ot <= 0:
             raise ValueError('Sinkhorn reg and iteration count must be positive')
         self.size = crop_size // stride
         self.wot, self.wtv = wot, wtv
+        self.count_loss_weight = count_loss_weight
         self.ot = OT_Loss(crop_size, stride, norm_cood, device,
                           num_of_iter_in_ot, reg)
 
@@ -72,6 +75,8 @@ class DMCountLoss(nn.Module):
         else:
             ot, wd, objective = density.new_zeros(()), 0.0, density.new_zeros(())
         weighted_ot, weighted_tv = self.wot * ot, self.wtv * tv
-        return dict(total=count + weighted_ot + weighted_tv, count=count, ot=ot, tv=tv,
+        weighted_count = self.count_loss_weight * count
+        return dict(total=weighted_count + weighted_ot + weighted_tv, count=count, ot=ot, tv=tv,
+                    weighted_count=weighted_count,
                     weighted_ot=weighted_ot, weighted_tv=weighted_tv,
                     wasserstein=density.new_tensor(wd), ot_objective=objective)

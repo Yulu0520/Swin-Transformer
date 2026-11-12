@@ -1,4 +1,4 @@
-"""Train a baseline and mutually exclusive DoRA/DoRA1 adapter branches."""
+"""Train baseline, DoRA/DoRA1 branches and optional mix head fine-tuning."""
 
 import argparse
 import copy
@@ -19,9 +19,22 @@ def parse_args():
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
-        '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1'],
+        '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1', 'finetune'],
         default='all',
         help='all: baseline->DoRA->DoRA1; both: baseline->DoRA')
+    parser.add_argument('--finetune-after-all', action='store_true',
+                        help='append mix head-only fine-tuning to --stage all')
+    parser.add_argument('--finetune-checkpoint', default='',
+                        help='complete DoRA1 weights (.pth/.tar) or ranked run directory')
+    parser.add_argument('--finetune-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/train')
+    parser.add_argument('--finetune-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--finetune-router-mode', choices=['classifier', 'filename'], default='classifier')
+    parser.add_argument('--router-checkpoint', default='', help='trained frozen image router for fine-tuning')
+    parser.add_argument('--finetune-epochs', type=int, default=50)
+    parser.add_argument('--finetune-start-lr', type=float, default=1e-7)
+    parser.add_argument('--finetune-lr', type=float, default=1e-6, help='peak LR after warmup')
+    parser.add_argument('--finetune-min-lr', type=float, default=1e-8)
+    parser.add_argument('--finetune-warmup-epochs', type=int, default=5)
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
@@ -55,7 +68,7 @@ def parse_args():
     parser.add_argument('--dora1-alpha', type=float, default=4.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save-dir', default='model')
-    parser.add_argument('--save-all', action='store_true')
+    parser.add_argument('--save-all', action='store_true', help='deprecated: every stage now always keeps top-5 weights')
     parser.add_argument('--lr', type=float, default=5*1e-6)
     parser.add_argument('--dora-lr', type=float, default=2e-4)
     parser.add_argument('--dora1-lr', type=float, default=2e-4)
@@ -63,7 +76,8 @@ def parse_args():
     parser.add_argument('--resume', default='',
                         help='continue the selected stage from its .tar checkpoint')
     
-    parser.add_argument('--max-model-num', type=int, default=1)
+    parser.add_argument('--max-model-num', type=int, default=1,
+                        help='number of epoch .tar resume snapshots; ranked top-5 .pth retention is independent')
     parser.add_argument('--pretrain-epochs', type=int, default=10,
                         help='number of clean baseline training epochs')
     parser.add_argument('--pretrain-val-epoch', type=int, default=5,
@@ -87,14 +101,16 @@ def parse_args():
                         help='first zero-based DoRA1 epoch eligible for validation')
     
     parser.add_argument('--batch-size', type=int, default=4)
-    parser.add_argument('--device', default='0')
+    parser.add_argument('--device', default='0', help='GPU index or cpu')
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--tensorboard-log-interval', type=int, default=10,
                         help='batch interval for TensorBoard and train.log loss')
     parser.add_argument('--is-gray', action='store_true')
     parser.add_argument('--crop-size', type=int, default=256)
     parser.add_argument('--downsample-ratio', type=int, choices=[8], default=8)
-    parser.add_argument('--wot', type=float, default=0.1, help='OT loss weight')
+    parser.add_argument('--count-loss-weight', type=float, default=1.0,
+                        help='Count L1 loss weight (all training stages)')
+    parser.add_argument('--wot', type=float, default=0.01, help='OT loss weight')
     parser.add_argument('--wtv', type=float, default=0.01, help='TV loss weight')
     parser.add_argument('--reg', type=float, default=10.0, help='Sinkhorn entropy regularization')
     parser.add_argument('--num-of-iter-in-ot', type=int, default=100, help='maximum Sinkhorn iterations')
@@ -102,14 +118,38 @@ def parse_args():
                         help='normalize OT coordinates to [-1, 1]; default matches CCTrans')
     
     args = parser.parse_args()
+    if args.max_model_num < 1:
+        parser.error('--max-model-num must be positive (epoch resume-checkpoint retention)')
+    will_finetune = args.stage == 'finetune' or args.finetune_after_all
+    if args.finetune_after_all and args.stage != 'all':
+        parser.error('--finetune-after-all requires --stage all')
+    if args.stage == 'finetune' and not (args.finetune_checkpoint or args.resume):
+        parser.error('--stage finetune needs --finetune-checkpoint or --resume')
+    if args.stage == 'finetune' and (args.init_checkpoint or args.backbone_checkpoint):
+        parser.error('Fine-tuning uses --finetune-checkpoint, not --init-checkpoint/--backbone-checkpoint')
+    if args.finetune_after_all and args.finetune_checkpoint:
+        parser.error('The four-stage pipeline uses its newly trained DoRA1 checkpoint')
+    if will_finetune:
+        if not (args.finetune_train_dir and args.finetune_val_dir):
+            parser.error('Fine-tuning requires training and validation directories')
+        if args.finetune_router_mode == 'classifier' and not os.path.isfile(args.router_checkpoint):
+            parser.error('Classifier fine-tuning requires an existing --router-checkpoint')
+        rates = (args.finetune_start_lr, args.finetune_lr, args.finetune_min_lr)
+        if any(not math.isfinite(rate) or rate <= 0 for rate in rates):
+            parser.error('Fine-tuning learning rates must be finite and positive')
+        if not args.finetune_min_lr <= args.finetune_start_lr <= args.finetune_lr:
+            parser.error('Expected finetune-min-lr <= finetune-start-lr <= finetune-lr')
+        if not 0 <= args.finetune_warmup_epochs < args.finetune_epochs:
+            parser.error('Warmup must be nonnegative and shorter than finetune-epochs')
     if args.init_checkpoint and (args.resume or args.backbone_checkpoint):
         parser.error('--init-checkpoint cannot be combined with --resume or --backbone-checkpoint')
     if args.resume and not args.resume.endswith('.tar'):
         parser.error('--resume requires an epoch .tar; use --init-checkpoint for weights only')
     if args.backbone_checkpoint and (args.resume or args.stage not in ('baseline', 'both', 'all')):
         parser.error('--backbone-checkpoint is for a new baseline, without --resume')
-    if any(not math.isfinite(value) or value < 0 for value in (args.wot, args.wtv)):
-        parser.error('--wot and --wtv must be finite and nonnegative')
+    if any(not math.isfinite(value) or value < 0
+           for value in (args.count_loss_weight, args.wot, args.wtv)):
+        parser.error('--count-loss-weight, --wot and --wtv must be finite and nonnegative')
     if not math.isfinite(args.reg) or args.reg <= 0 or args.num_of_iter_in_ot <= 0:
         parser.error('--reg and --num-of-iter-in-ot must be positive')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume or args.init_checkpoint):
@@ -170,19 +210,26 @@ def run_stage(args, stage, parent_checkpoint=''):
         stage_args.max_epoch = args.dora_epochs
         stage_args.val_epoch = args.dora_val_epoch
         stage_args.val_start = args.dora_val_start
-    else:
+    elif stage == 'dora1':
         stage_args.max_epoch = args.dora1_epochs
         stage_args.val_epoch = args.dora1_val_epoch
         stage_args.val_start = args.dora1_val_start
+    else:
+        stage_args.max_epoch = args.finetune_epochs
+        stage_args.val_epoch = 1
+        stage_args.val_start = 0
     stage_args.save_dir = os.path.join(args.save_dir, args.model_name, stage)
     stage_args.lr = {
         'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr,
+        'finetune': args.finetune_lr,
     }[stage]
     if parent_checkpoint:
         if stage == 'dora':
             stage_args.baseline_checkpoint = parent_checkpoint
         elif stage == 'dora1':
             stage_args.dora_checkpoint = parent_checkpoint
+        elif stage == 'finetune':
+            stage_args.finetune_checkpoint = parent_checkpoint
         stage_args.resume = ''
         stage_args.init_checkpoint = ''
     seed_everything(stage_args.seed)
@@ -193,7 +240,7 @@ def run_stage(args, stage, parent_checkpoint=''):
 
 
 def run_pipeline(args):
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
+    os.environ['CUDA_VISIBLE_DEVICES'] = '' if args.device == 'cpu' else args.device.strip()
     if args.stage in ('both', 'all'):
         best_baseline = run_stage(args, 'baseline')
         if not best_baseline:
@@ -206,6 +253,13 @@ def run_pipeline(args):
         gc.collect()
         torch.cuda.empty_cache()
         best_dora1 = run_stage(args, 'dora1', parent_checkpoint=best_dora)
+        if args.finetune_after_all:
+            if not best_dora1:
+                raise RuntimeError('DoRA1 produced no best checkpoint')
+            gc.collect()
+            torch.cuda.empty_cache()
+            best_finetune = run_stage(args, 'finetune', parent_checkpoint=best_dora1)
+            return best_baseline, best_dora, best_dora1, best_finetune
         return best_baseline, best_dora, best_dora1
     return run_stage(args, args.stage)
 

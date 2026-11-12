@@ -21,7 +21,7 @@ def load_visualization_model(args, device):
     state = checkpoint.get('model_state_dict', checkpoint)
     dual = any('.parametrizations.weight.0.dora1.' in key for key in state)
     adapter = any('.parametrizations.weight.' in key for key in state)
-    if dual and checkpoint.get('stage', 'dora1') == 'dora1':
+    if dual and checkpoint.get('stage', 'dora1') in ('dora1', 'finetune'):
         model = build_dual_dora_model(args, args.model_path)
     else:
         model = build_model(args, args.model_path, expect_dora=adapter)

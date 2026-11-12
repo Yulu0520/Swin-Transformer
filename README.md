@@ -20,9 +20,12 @@ flowchart TD
     A --> SUM[Elementwise sum]
     B --> SUM
     C --> SUM
-    SUM --> D1[3x3 CBR: dilation 1, 256 to 128]
-    SUM --> D2[3x3 CBR: dilation 2, 256 to 128]
-    SUM --> D3[3x3 CBR: dilation 3, 256 to 128]
+    SUM --> P1[1x1 CBR: 256 to 256]
+    SUM --> P2[3x3 CBR: 256 to 256]
+    SUM --> P3[5x5 CBR: 256 to 256]
+    P1 --> D1[3x3 CBR: dilation 1, 256 to 128]
+    P2 --> D2[3x3 CBR: dilation 2, 256 to 128]
+    P3 --> D3[3x3 CBR: dilation 3, 256 to 128]
     SUM --> SKIP[1x1 CBR: 256 to 384]
     D1 --> CAT[Concatenate channels: 384]
     D2 --> CAT
@@ -34,7 +37,25 @@ flowchart TD
     OUT --> COUNT[Sum density pixels to predict count]
 ```
 
-CBR means Conv + BatchNorm + ReLU. Upsampling is bilinear with
+CBR means Conv + BatchNorm + ReLU. New training defaults to
+`--mdc-mode preconv`: each MDC branch has a 1x1, 3x3 or 5x5 CBR (256 to 256)
+before its existing 3x3 dilated CBR (256 to 128, dilation 1/2/3). Padding 0/1/2
+preserves spatial size in the pre-convolutions. This adds 2,296,064 trainable
+parameters compared with `--mdc-mode legacy`, the original reproduction head.
+The shortcut, 384-channel concatenation, density predictor and stride are unchanged.
+This follows the paper's branch layout; the Swin backbone, later predictor and
+DM-Count loss remain project choices rather than an exact paper reproduction.
+
+Use `--mdc-mode legacy` to train/resume the earlier architecture. Inference
+(`test.py` and visualization) identifies either mode from checkpoint keys, even
+for raw `.pth` files; no additional inference flag is needed. Complete weight
+loads require matching MDC modes. To try preconv, train a new baseline, then
+DoRA, DoRA1 and optional mix fine-tuning. Existing clean backbone weights may be
+reused with `--backbone-checkpoint`; there is no silent partial head loading.
+The new CBRs and their BatchNorm statistics need baseline training before the
+frozen-BN adapter/fine-tuning stages.
+
+Upsampling is bilinear with
 `align_corners=True`, as in CCTrans, but uses the actual stage-2 spatial size
 rather than fixed scale factors. Stage 2/3 have no extra output LayerNorm;
 stage 4 retains the existing backbone LayerNorm.
@@ -188,7 +209,8 @@ python train.py --stage finetune \
   --finetune-checkpoint /path/to/dora1/run_directory \
   --router-checkpoint /path/to/router/best_model.pth \
   --finetune-train-dir /path/to/SHA/mix/train \
-  --finetune-val-dir /path/to/SHA/mix/val
+  --finetune-val-dir /path/to/SHA/mix/val \
+  --finetune-lr 1e-7 --weight-decay 1e-5
 
 # Run all four stages; the best-ranked weights feed the next stage.
 python train.py --stage all --finetune-after-all \
@@ -200,10 +222,13 @@ python train.py --stage finetune \
   --finetune-router-mode filename
 ```
 
-Defaults: Adam, 50 epochs, starting LR `1e-7`, linear warmup for 5 epochs to
-`1e-6`, then cosine decay toward `1e-8`. Flags are `--finetune-epochs`,
-`--finetune-start-lr`, `--finetune-lr`, `--finetune-min-lr`, and
-`--finetune-warmup-epochs`. Zero warmup starts directly at the peak LR.
+Defaults: Adam, 50 epochs, **constant LR `1e-7`**, and the same
+`--weight-decay 1e-5` used by baseline/DoRA/DoRA1. Set `--finetune-lr` to change
+the fixed LR; weight decay regularizes trainable parameters and does not decay
+the learning rate. There is no warmup/cosine scheduler. The old
+`--finetune-start-lr`, `--finetune-min-lr`, and `--finetune-warmup-epochs` flags
+have been removed. To fine-tune an old DoRA1 model without changing its head,
+add `--mdc-mode legacy` to the training command.
 Validation runs before any updates (epoch 0) and after every epoch, reporting
 mix overall/day/night MAE and RMSE, route counts, and router accuracy against
 filename labels. These labels are diagnostic; classifier decisions use pixels.
@@ -211,10 +236,12 @@ The untouched epoch-0 weights are eligible for the top five.
 
 `--stage all` without `--finetune-after-all` still runs the original three stages.
 To resume fine-tuning, use `--stage finetune --resume /path/to/N_ckpt.tar`
-with the same data, routing mode/checkpoint, adapter settings, loss settings and
-complete LR schedule. The router file content is checked by SHA256. Resume
-restores optimizer, scheduler, epoch and top-five rankings; the initial
-validation is not repeated. Changing these settings requires a fresh run.
+with the same MDC mode, data, routing mode/checkpoint, adapter settings, loss
+settings, fixed LR and weight decay. The router file content is checked by
+SHA256. Resume restores optimizer, epoch and top-five rankings; the initial
+validation is not repeated. Old warmup/cosine fine-tune `.tar` files can still be
+evaluated but cannot resume into the constant-LR training mode. Start a fresh
+fine-tune from the matching DoRA1 model when changing this training policy.
 
 ### Top-five checkpoint policy
 
@@ -253,8 +280,10 @@ This option requires a matching Swin variant, a clean baseline without adapters,
 and cannot be combined with resume. It also works with a new clean baseline.
 There is no implicit partial loading of an incompatible head.
 
-Epoch `.tar` checkpoints record `architecture=swin_cctrans_regression_v1`,
-`output_stride=8`, model name, stage, optimizer, crop size, `loss_type=dm_count_v1`,
+Epoch `.tar` checkpoints record `mdc_mode` and
+`architecture=swin_cctrans_regression_v2_mdc_preconv` (or
+`swin_cctrans_regression_v1` for legacy), `output_stride=8`, model name, stage,
+optimizer, crop size, `loss_type=dm_count_v1`,
 the complete OT/TV settings and crop-target policy, and adapter settings. Best `.pth` files remain raw state dicts; head keys and
 strict weight shapes verify compatibility. Supply matching adapter rank/alpha
 when loading `.pth`. Resume a new-architecture stage with `--resume file.tar`.
@@ -268,7 +297,7 @@ To reuse a full baseline (backbone and head) from the previous objective, start
 a fresh experiment with a new optimizer, epoch counter and best metrics:
 
 ```bash
-python train.py --stage baseline --model-name swin_t_trans \
+python train.py --stage baseline --model-name swin_t_trans --mdc-mode legacy \
   --init-checkpoint /path/to/previous/baseline/best_model.pth \
   --save-dir model_dm_count --pretrain-epochs 100 --pretrain-val-epoch 1
 ```
@@ -372,7 +401,7 @@ points, zero/tiny predictions, both backbones, all selected stages' gradients,
 real baseline/adapter training steps, frozen BatchNorm, weight-only migration,
 resume setting checks, checkpoint compatibility and existing routing behavior.
 Fine-tuning tests also cover grouped branch order, frozen backbone/BN state,
-LR schedule restoration, real CPU training/resume, epoch-0 retention and top-five
+fixed LR/weight decay restoration, real CPU training/resume, epoch-0 retention and top-five
 selection using full-precision scores.
 
 ## Citation

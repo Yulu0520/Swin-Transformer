@@ -75,6 +75,7 @@ class CCTransRegressionTest(unittest.TestCase):
         for stage in stages:
             self.assertGreater(stage.grad.abs().sum().item(), 0)
         for module in [model.regression.v1, model.regression.v2, model.regression.v3,
+                       model.regression.pre1, model.regression.pre2, model.regression.pre3,
                        model.regression.stage1, model.regression.stage2,
                        model.regression.stage3, model.regression.stage4, model.regression.res]:
             self.assertGreater(module[0].weight.grad.abs().sum().item(), 0)

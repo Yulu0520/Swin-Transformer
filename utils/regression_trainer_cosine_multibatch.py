@@ -15,12 +15,11 @@ import logging
 import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models import swin_c_multibatch as models
-from models.counting_checkpoint import OUTPUT_STRIDE
+from models.counting_checkpoint import OUTPUT_STRIDE, validate_model_mdc
 from utils.counting_model import (load_checkpoint, load_backbone_weights,
                                   load_initial_weights, load_finetune_weights)
 from utils.topk_checkpoint import TopKCheckpoints
-from utils.finetune import (freeze_for_finetune, set_finetune_mode,
-                            make_finetune_scheduler, finetune_config)
+from utils.finetune import freeze_for_finetune, set_finetune_mode, finetune_config
 from utils.routing import (select_routes, forward_routed_regression,
                            route_from_filename, count_metrics)
 from models.day_night_router import load_day_night_router
@@ -125,7 +124,8 @@ class RegTrainer(Trainer):
                           and not args.resume and not args.backbone_checkpoint
                           and not args.init_checkpoint)
         self.model = model_builder(pretrained=use_pretrained,
-                                   pretrained_path=args.pretrained_path)
+                                   pretrained_path=args.pretrained_path,
+                                   mdc_mode=args.mdc_mode)
         if args.stage == 'baseline' and args.backbone_checkpoint:
             load_backbone_weights(self.model, args.backbone_checkpoint)
         if args.stage == 'finetune':
@@ -139,6 +139,7 @@ class RegTrainer(Trainer):
         elif args.stage == 'dora':
             if not args.resume:
                 checkpoint = load_checkpoint(args.baseline_checkpoint)
+                validate_model_mdc(self.model, checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'baseline') != 'baseline':
                         raise ValueError('DoRA needs a baseline checkpoint')
@@ -161,6 +162,7 @@ class RegTrainer(Trainer):
                     active_route='dora1', trainable_route='dora1')
             else:
                 checkpoint = load_checkpoint(args.dora_checkpoint)
+                validate_model_mdc(self.model, checkpoint)
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     if checkpoint.get('stage', 'dora') != 'dora':
                         raise ValueError('DoRA1 needs a DoRA checkpoint')
@@ -228,7 +230,7 @@ class RegTrainer(Trainer):
                      sum(parameter.numel() for parameter in trainable),
                      sum(parameter.numel() for parameter in self.model.parameters()))
         self.optimizer = optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
-        self.scheduler = make_finetune_scheduler(self.optimizer, args) if args.stage == 'finetune' else None
+        self.scheduler = None  # All stages use a constant LR with Adam weight decay.
 
         self.start_epoch = 0
         resumed_state = {}
@@ -236,9 +238,13 @@ class RegTrainer(Trainer):
             suf = args.resume.rsplit('.', 1)[-1]
             if suf == 'tar':
                 checkpoint = load_checkpoint(args.resume)
+                validate_model_mdc(self.model, checkpoint)
                 validate_resume_loss(checkpoint, args)
                 if args.stage == 'finetune' and checkpoint.get('finetune_config') != self.finetune_settings:
-                    raise ValueError('Fine-tune router/data/LR schedule settings do not match the checkpoint')
+                    raise ValueError('Fine-tune router/data/LR schedule settings or weight decay do not match '
+                                     'the checkpoint. Warmup/cosine runs cannot be resumed as fixed-LR runs.')
+                if args.stage == 'finetune' and checkpoint.get('scheduler_state_dict') is not None:
+                    raise ValueError('Fixed-LR fine-tuning cannot resume a warmup/cosine scheduler')
                 resumed_state = checkpoint
                 if checkpoint.get('stage', 'baseline') != args.stage:
                     raise ValueError('Resume checkpoint stage does not match')
@@ -254,8 +260,6 @@ class RegTrainer(Trainer):
                     raise ValueError('Resume checkpoint adapter settings do not match')
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                if self.scheduler is not None:
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 # New checkpoints store both the human-facing 1-based epoch
                 # and its internal 0-based index. Older checkpoints only have
                 # the 0-based ``epoch`` field.
@@ -324,8 +328,6 @@ class RegTrainer(Trainer):
                     and (self.epoch_index - args.val_start) % args.val_epoch == 0
                 ):
                     self.val_epoch()
-                if self.scheduler is not None:
-                    self.scheduler.step()
                 self.save_epoch()
         finally:
             self.writer.close()
@@ -428,6 +430,7 @@ class RegTrainer(Trainer):
             'epoch_index': self.epoch_index,
             'model_name': self.args.model_name,
             'architecture': self.model.architecture,
+            'mdc_mode': self.model.mdc_mode,
             'output_stride': self.model.output_stride,
             'stage': self.args.stage,
             'crop_size': self.args.crop_size,

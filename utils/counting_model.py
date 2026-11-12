@@ -7,7 +7,8 @@ import torch
 from utils.topk_checkpoint import best_ranked_path
 
 from models import swin_c_multibatch as models
-from models.counting_checkpoint import validate_counting_checkpoint
+from models.counting_checkpoint import (validate_counting_checkpoint, checkpoint_mdc_mode,
+                                        validate_model_mdc)
 from models.swin_dual_dora import (
     extract_dora_from_legacy_state,
     has_legacy_dora_lora_adapters,
@@ -31,6 +32,7 @@ def load_checkpoint(path):
 def load_initial_weights(model, args):
     """Load a same-stage model for a new objective, without training state."""
     checkpoint = load_checkpoint(args.init_checkpoint)
+    validate_model_mdc(model, checkpoint)
     state = checkpoint.get('model_state_dict', checkpoint)
     if 'model_state_dict' in checkpoint:
         if checkpoint.get('model_name') != args.model_name or checkpoint.get('stage') != args.stage:
@@ -142,7 +144,7 @@ def build_model(args, checkpoint_path, expect_dora):
             '{} contains an adapter and is not a baseline checkpoint'.format(
                 checkpoint_path))
 
-    model = getattr(models, args.model_name)(pretrained=False)
+    model = getattr(models, args.model_name)(pretrained=False, mdc_mode=checkpoint_mdc_mode(checkpoint))
     if expect_dora:
         if contains_parallel:
             model.enable_dual_dora(
@@ -193,7 +195,7 @@ def build_dual_dora_model(args, checkpoint_path):
     if not all((dora_rank, dora_alpha, dora1_rank, dora1_alpha)):
         raise ValueError('DoRA and DoRA1 rank/alpha must be positive')
 
-    model = getattr(models, args.model_name)(pretrained=False)
+    model = getattr(models, args.model_name)(pretrained=False, mdc_mode=checkpoint_mdc_mode(checkpoint))
     model.enable_dual_dora(
         dora_rank, dora_alpha, dora1_rank, dora1_alpha,
         active_route=args.dual_route)
@@ -205,6 +207,7 @@ def build_dual_dora_model(args, checkpoint_path):
 def load_finetune_weights(model, args, path, expected_stage='dora1'):
     """Attach both frozen adapters and load a complete DoRA1 (or resume) model."""
     checkpoint = load_checkpoint(path)
+    validate_model_mdc(model, checkpoint)
     state = checkpoint.get('model_state_dict', checkpoint)
     if 'model_state_dict' in checkpoint:
         if checkpoint.get('stage') != expected_stage or checkpoint.get('model_name') != args.model_name:

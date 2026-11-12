@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument('--model-name', choices=['swin_l_trans', 'swin_t_trans'],
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
+    parser.add_argument('--mdc-mode', choices=['preconv', 'legacy'], default='preconv',
+                        help='preconv: add 1/3/5 CBRs before dilation; legacy: original reproduction head')
     parser.add_argument(
         '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1', 'finetune'],
         default='all',
@@ -31,10 +33,8 @@ def parse_args():
     parser.add_argument('--finetune-router-mode', choices=['classifier', 'filename'], default='classifier')
     parser.add_argument('--router-checkpoint', default='', help='trained frozen image router for fine-tuning')
     parser.add_argument('--finetune-epochs', type=int, default=50)
-    parser.add_argument('--finetune-start-lr', type=float, default=1e-7)
-    parser.add_argument('--finetune-lr', type=float, default=1e-6, help='peak LR after warmup')
-    parser.add_argument('--finetune-min-lr', type=float, default=1e-8)
-    parser.add_argument('--finetune-warmup-epochs', type=int, default=5)
+    parser.add_argument('--finetune-lr', type=float, default=1e-7,
+                        help='constant fine-tuning LR; Adam uses the shared --weight-decay')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
@@ -134,13 +134,12 @@ def parse_args():
             parser.error('Fine-tuning requires training and validation directories')
         if args.finetune_router_mode == 'classifier' and not os.path.isfile(args.router_checkpoint):
             parser.error('Classifier fine-tuning requires an existing --router-checkpoint')
-        rates = (args.finetune_start_lr, args.finetune_lr, args.finetune_min_lr)
-        if any(not math.isfinite(rate) or rate <= 0 for rate in rates):
-            parser.error('Fine-tuning learning rates must be finite and positive')
-        if not args.finetune_min_lr <= args.finetune_start_lr <= args.finetune_lr:
-            parser.error('Expected finetune-min-lr <= finetune-start-lr <= finetune-lr')
-        if not 0 <= args.finetune_warmup_epochs < args.finetune_epochs:
-            parser.error('Warmup must be nonnegative and shorter than finetune-epochs')
+        if not math.isfinite(args.finetune_lr) or args.finetune_lr <= 0:
+            parser.error('--finetune-lr must be finite and positive')
+        if args.finetune_epochs <= 0:
+            parser.error('--finetune-epochs must be positive')
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error('--weight-decay must be finite and nonnegative')
     if args.init_checkpoint and (args.resume or args.backbone_checkpoint):
         parser.error('--init-checkpoint cannot be combined with --resume or --backbone-checkpoint')
     if args.resume and not args.resume.endswith('.tar'):

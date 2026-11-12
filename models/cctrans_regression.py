@@ -2,6 +2,7 @@
 
 Reference: Yulu0520/CCTrans-Crowd-Counting, Networks/ALTGVT.py,
 commit 71210285a36eb76cb22b3789dd10ee04235a17fa, class Regression.
+The default preconv mode adds the paper's 1/3/5-kernel CBRs before dilation.
 """
 
 from torch import cat, nn
@@ -9,7 +10,7 @@ from torch.nn import functional as F
 
 
 def cbr(in_channels, out_channels, kernel_size=3, dilation=1):
-    padding = dilation if kernel_size == 3 else 0
+    padding = (kernel_size // 2) * dilation
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size,
                   padding=padding, dilation=dilation),
@@ -19,11 +20,18 @@ def cbr(in_channels, out_channels, kernel_size=3, dilation=1):
 
 
 class CCTransRegression(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, mdc_mode='preconv'):
         super().__init__()
+        if mdc_mode not in ('legacy', 'preconv'):
+            raise ValueError('Unknown MDC mode: {}'.format(mdc_mode))
+        self.mdc_mode = mdc_mode
         self.v1 = cbr(in_channels[0], 256)
         self.v2 = cbr(in_channels[1], 256)
         self.v3 = cbr(in_channels[2], 256)
+        # Separate names preserve all existing dilated-convolution weight keys.
+        self.pre1 = cbr(256, 256, kernel_size=1) if mdc_mode == 'preconv' else nn.Identity()
+        self.pre2 = cbr(256, 256, kernel_size=3) if mdc_mode == 'preconv' else nn.Identity()
+        self.pre3 = cbr(256, 256, kernel_size=5) if mdc_mode == 'preconv' else nn.Identity()
         self.stage1 = cbr(256, 128, dilation=1)
         self.stage2 = cbr(256, 128, dilation=2)
         self.stage3 = cbr(256, 128, dilation=3)
@@ -47,8 +55,8 @@ class CCTransRegression(nn.Module):
         stage3 = F.interpolate(stage3, size=size, mode='bilinear', align_corners=True)
         stage4 = F.interpolate(stage4, size=size, mode='bilinear', align_corners=True)
         fused = self.v1(stage2) + self.v2(stage3) + self.v3(stage4)
-        features = cat((self.stage1(fused), self.stage2(fused),
-                        self.stage3(fused)), dim=1) + self.stage4(fused)
+        features = cat((self.stage1(self.pre1(fused)), self.stage2(self.pre2(fused)),
+                        self.stage3(self.pre3(fused))), dim=1) + self.stage4(fused)
         return fused, features
 
     def forward(self, stage2, stage3, stage4):

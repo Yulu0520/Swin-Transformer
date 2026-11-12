@@ -1,11 +1,9 @@
-"""Head-only fine-tuning policy and reproducible conservative LR scheduling."""
+"""Head-only fine-tuning policy with constant Adam LR and shared weight decay."""
 
 import hashlib
-import math
 from pathlib import Path
 
 from torch import nn
-from torch.optim.lr_scheduler import LambdaLR
 
 
 def freeze_for_finetune(model):
@@ -24,18 +22,6 @@ def set_finetune_mode(model):
             module.eval()  # affine parameters still receive gradients
 
 
-def make_finetune_scheduler(optimizer, args):
-    def factor(index):
-        if args.finetune_warmup_epochs and index < args.finetune_warmup_epochs:
-            lr = args.finetune_start_lr + (args.finetune_lr - args.finetune_start_lr) * index / args.finetune_warmup_epochs
-        else:
-            progress = min(max((index - args.finetune_warmup_epochs) /
-                (args.finetune_epochs - args.finetune_warmup_epochs), 0.0), 1.0)
-            lr = args.finetune_min_lr + 0.5 * (args.finetune_lr - args.finetune_min_lr) * (1 + math.cos(math.pi * progress))
-        return lr / args.finetune_lr
-    return LambdaLR(optimizer, factor)
-
-
 def router_fingerprint(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -50,7 +36,7 @@ def finetune_config(args):
                        if args.finetune_router_mode == 'classifier' else None),
         train_dir=str(Path(args.finetune_train_dir).resolve()),
         val_dir=str(Path(args.finetune_val_dir).resolve()),
-        epochs=args.finetune_epochs, warmup_epochs=args.finetune_warmup_epochs,
-        start_lr=args.finetune_start_lr, peak_lr=args.finetune_lr,
-        min_lr=args.finetune_min_lr, freeze_bn_statistics=True,
+        epochs=args.finetune_epochs, lr_schedule='constant',
+        lr=args.finetune_lr, optimizer='Adam', weight_decay=args.weight_decay,
+        freeze_bn_statistics=True,
         trainable='regression.*', route_input='original_image_224_before_augmentation')

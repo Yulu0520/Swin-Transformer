@@ -7,7 +7,7 @@ import os
 import re
 
 from .cctrans_regression import CCTransRegression
-from .counting_checkpoint import ARCHITECTURE, OUTPUT_STRIDE
+from .counting_checkpoint import ARCHITECTURE, OUTPUT_STRIDE, architecture_for_mdc
 from .swin_dora import add_swin_qv_dora
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
@@ -71,8 +71,10 @@ class SwinTransMultiBatch(nn.Module):
     architecture = ARCHITECTURE
     output_stride = OUTPUT_STRIDE
 
-    def __init__(self, pretrained=True, variant='large', pretrained_path=None):
+    def __init__(self, pretrained=True, variant='large', pretrained_path=None, mdc_mode='preconv'):
         super().__init__()
+        self.mdc_mode = mdc_mode
+        self.architecture = architecture_for_mdc(mdc_mode)
         if variant == 'large':
             backbone = SwinTransformer(
                 patch_size=[4, 4], embed_dim=192, depths=[2, 2, 18, 2],
@@ -92,7 +94,7 @@ class SwinTransMultiBatch(nn.Module):
         self.backbone_features = backbone.features
         self.backbone_norm = backbone.norm
 
-        self.regression = CCTransRegression(stage_channels)
+        self.regression = CCTransRegression(stage_channels, mdc_mode=mdc_mode)
 
     def forward_backbone(self, x):
         # Preserve edge pixels for arbitrary validation image sizes. Training
@@ -149,10 +151,10 @@ class SwinTransMultiBatch(nn.Module):
         return set_swin_adapter_route(self.backbone_features, route)
 
 
-def swin_t_trans(pretrained=True, pretrained_path=None):
-    return SwinTransMultiBatch(pretrained=pretrained, variant='tiny')
+def swin_t_trans(pretrained=True, pretrained_path=None, mdc_mode='preconv'):
+    return SwinTransMultiBatch(pretrained=pretrained, variant='tiny', mdc_mode=mdc_mode)
 
 
-def swin_l_trans(pretrained=True, pretrained_path=None):
+def swin_l_trans(pretrained=True, pretrained_path=None, mdc_mode='preconv'):
     return SwinTransMultiBatch(
-        pretrained=pretrained, variant='large', pretrained_path=pretrained_path)
+        pretrained=pretrained, variant='large', pretrained_path=pretrained_path, mdc_mode=mdc_mode)

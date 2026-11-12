@@ -15,7 +15,7 @@ from datasets.day_night import build_router_transform
 from losses.dm_count import DMCountLoss
 from models.swin_c_multibatch import swin_t_trans
 from utils.counting_model import build_dual_dora_model
-from utils.finetune import freeze_for_finetune, make_finetune_scheduler, finetune_config
+from utils.finetune import freeze_for_finetune
 from utils.regression_trainer_cosine_multibatch import RegTrainer
 from utils.routing import forward_routed_regression, select_routes
 from utils.topk_checkpoint import best_ranked_path
@@ -33,7 +33,7 @@ def parse_finetune(source, data, **options):
         '--finetune-checkpoint', str(source), '--finetune-router-mode', 'filename',
         '--finetune-train-dir', str(data / 'train'), '--finetune-val-dir', str(data / 'val'),
         '--crop-size', '64', '--batch-size', '2', '--num-workers', '0',
-        '--finetune-epochs', '3', '--finetune-warmup-epochs', '1']
+        '--finetune-epochs', '3']
     for name, value in options.items():
         flags += ['--' + name.replace('_', '-'), str(value)]
     with patch('sys.argv', flags):
@@ -109,32 +109,24 @@ class FineTuneTest(unittest.TestCase):
                             for name, tensor in before.items() if name.startswith('regression.')))
         self.assertTrue(all(p.grad is None for p in model.backbone_features.parameters()))
 
-    def test_scheduler_starts_small_warms_up_decays_and_resumes_exactly(self):
-        from types import SimpleNamespace
-        args = SimpleNamespace(finetune_start_lr=1e-7, finetune_lr=1e-6,
-            finetune_min_lr=1e-8, finetune_warmup_epochs=5, finetune_epochs=50)
+    def test_constant_lr_and_adam_weight_decay_survive_optimizer_resume(self):
         p = nn.Parameter(torch.ones(1))
-        opt = torch.optim.Adam([p], lr=args.finetune_lr)
-        scheduler = make_finetune_scheduler(opt, args)
-        self.assertAlmostEqual(opt.param_groups[0]['lr'], 1e-7)
-        values = []
-        for epoch in range(51):
-            values.append(opt.param_groups[0]['lr'])
-            if epoch == 13:
-                opt_state, schedule_state = copy.deepcopy(opt.state_dict()), copy.deepcopy(scheduler.state_dict())
+        opt = torch.optim.Adam([p], lr=1e-7, weight_decay=1e-5)
+        for epoch in range(5):
+            # A zero task gradient still permits Adam's weight decay to act.
+            p.grad = torch.zeros_like(p)
             opt.step()
-            scheduler.step()
-        self.assertAlmostEqual(values[5], 1e-6)
-        self.assertAlmostEqual(values[50], 1e-8)
-        self.assertTrue(all(a <= b for a, b in zip(values[:5], values[1:6])))
-        opt2 = torch.optim.Adam([nn.Parameter(torch.ones(1))], lr=args.finetune_lr)
-        scheduler2 = make_finetune_scheduler(opt2, args)
-        opt2.load_state_dict(opt_state)
-        scheduler2.load_state_dict(schedule_state)
-        for expected in values[13:]:
-            self.assertEqual(opt2.param_groups[0]['lr'], expected)
-            opt2.step()
-            scheduler2.step()
+            self.assertEqual(opt.param_groups[0]['lr'], 1e-7)
+        self.assertLess(p.item(), 1.)
+        restored_p = nn.Parameter(p.detach().clone())
+        opt2 = torch.optim.Adam([restored_p], lr=9e-4)
+        opt2.load_state_dict(copy.deepcopy(opt.state_dict()))
+        self.assertEqual(opt2.param_groups[0]['lr'], 1e-7)
+        self.assertEqual(opt2.param_groups[0]['weight_decay'], 1e-5)
+        for parameter, optimizer in [(p, opt), (restored_p, opt2)]:
+            parameter.grad = torch.zeros_like(parameter)
+            optimizer.step()
+        torch.testing.assert_close(restored_p, p, rtol=0, atol=0)
 
     def test_real_finetune_setup_training_top5_and_resume_on_cpu(self):
         torch.manual_seed(3)
@@ -158,8 +150,11 @@ class FineTuneTest(unittest.TestCase):
             trainer.setup()
             frozen_before = {name: value.clone() for name, value in trainer.model.state_dict().items()
                              if not name.startswith('regression.')}
-            trainer.args.max_epoch = 1  # Interrupt after one epoch of the planned 3-epoch schedule.
+            trainer.args.max_epoch = 1  # Interrupt after one of the planned 3 epochs.
             trainer.train()
+            self.assertIsNone(trainer.scheduler)
+            self.assertEqual(trainer.optimizer.param_groups[0]['lr'], args.finetune_lr)
+            self.assertEqual(trainer.optimizer.param_groups[0]['weight_decay'], args.weight_decay)
             self.assertEqual([entry['epoch'] for entry in trainer.top_checkpoints.entries].count(0), 1)
             resume = Path(trainer.save_dir) / '1_ckpt.tar'
             resumed_args = parse_finetune(source_path, root / 'mix', resume=resume)
@@ -169,6 +164,7 @@ class FineTuneTest(unittest.TestCase):
             self.assertEqual(resumed.start_epoch, 1)
             self.assertEqual(resumed.optimizer.param_groups[0]['lr'], trainer.optimizer.param_groups[0]['lr'])
             resumed.train()
+            self.assertEqual(resumed.optimizer.param_groups[0]['lr'], args.finetune_lr)
             self.assertEqual(len(resumed.top_checkpoints.entries), 4)
             self.assertTrue(Path(best_ranked_path(resumed.save_dir)).is_file())
             for name, before in frozen_before.items():
@@ -181,12 +177,25 @@ class FineTuneTest(unittest.TestCase):
             with torch.no_grad():
                 inputs = torch.randn(1, 3, 64, 64)
                 torch.testing.assert_close(loaded(inputs), resumed.model(inputs))
-            # A changed schedule cannot silently resume the old LR trajectory.
+            # LR and weight decay are part of the fixed-LR resume configuration.
             changed = parse_finetune(source_path, root / 'mix', resume=checkpoint, finetune_lr=2e-6)
             changed.save_dir = str(root / 'bad_resume')
             bad = RegTrainer(changed)
             with self.assertRaisesRegex(ValueError, 'LR schedule settings'):
                 bad.setup()
+            changed = parse_finetune(source_path, root / 'mix', resume=checkpoint, weight_decay=2e-5)
+            changed.save_dir = str(root / 'bad_decay')
+            with self.assertRaisesRegex(ValueError, 'weight decay'):
+                RegTrainer(changed).setup()
+            snapshot = torch.load(checkpoint, map_location='cpu', weights_only=False)
+            snapshot['finetune_config'].pop('lr_schedule')
+            snapshot['scheduler_state_dict'] = {'last_epoch': 3}
+            old_path = root / 'old_cosine.tar'
+            torch.save(snapshot, old_path)
+            changed = parse_finetune(source_path, root / 'mix', resume=old_path)
+            changed.save_dir = str(root / 'old_cosine_resume')
+            with self.assertRaisesRegex(ValueError, 'Warmup/cosine'):
+                RegTrainer(changed).setup()
 
     def test_classifier_finetune_and_evaluation_cli_with_real_router_checkpoint(self):
         import csv
@@ -229,6 +238,8 @@ class FineTuneTest(unittest.TestCase):
             snapshot = torch.load(Path(trainer.save_dir) / '1_ckpt.tar',
                                   map_location='cpu', weights_only=False)
             self.assertEqual(snapshot['loss_config']['count_weight'], .5)
+            self.assertEqual(snapshot['finetune_config']['lr_schedule'], 'constant')
+            self.assertIsNone(snapshot['scheduler_state_dict'])
             del snapshot
             for name, value in trainer.image_router.state_dict().items():
                 torch.testing.assert_close(value, before[name], rtol=0, atol=0)

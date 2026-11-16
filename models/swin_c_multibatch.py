@@ -173,6 +173,17 @@ class SwinTransMultiBatch(nn.Module):
         """Select baseline, DoRA, or DoRA1 for every Swin Q/V projection."""
         return set_swin_adapter_route(self.backbone_features, route)
 
+    def enable_finetune(self):
+        """Train the shared MAN modules while keeping Swin and adapters fixed."""
+        self.requires_grad_(False)
+        for module in (self.feature_adapter, self.encoder, self.reg_layer_0):
+            module.requires_grad_(True)
+
+    def finetune_train_mode(self):
+        self.eval()
+        for module in (self.feature_adapter, self.encoder, self.reg_layer_0):
+            module.train()
+
 
 def swin_t_trans(pretrained=True, pretrained_path=None):
     return SwinTransMultiBatch(pretrained=pretrained, variant='tiny')

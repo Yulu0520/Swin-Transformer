@@ -31,8 +31,12 @@ def parse_args():
                         help='baseline checkpoint; defaults to the latest best_model*.pth')
     parser.add_argument('--dora-checkpoint', default='',
                         help='DoRA checkpoint; defaults to the latest best_model*.pth')
-    parser.add_argument('--dora1-checkpoint', default='model/swin_t_trans/dora1/1002-132111/best_model.pth',
+    parser.add_argument('--dora1-checkpoint', default='',
                         help='optional parallel DoRA/DoRA1 checkpoint')
+    parser.add_argument('--finetune-checkpoint', default='',
+                        help='fine-tune ranked .pth or last_checkpoint.tar')
+    parser.add_argument('--compare-before-after', action='store_true',
+                        help='compare --dora1-checkpoint with --finetune-checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
                         help='active branch when evaluating the dual checkpoint')
     parser.add_argument(
@@ -71,7 +75,7 @@ def parse_args():
 
 def load_checkpoint(path):
     try:
-        return torch.load(path, map_location='cpu', mmap=True)
+        return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
     except TypeError:
         return torch.load(path, map_location='cpu')
 
@@ -164,8 +168,8 @@ def build_dual_dora_model(args, checkpoint_path):
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
                 '{} model name does not match --model-name'.format(checkpoint_path))
-        if checkpoint.get('stage') != 'dora1':
-            raise ValueError('{} is not a DoRA1-stage checkpoint'.format(
+        if checkpoint.get('stage') not in ('dora1', 'finetune'):
+            raise ValueError('{} is not a DoRA1/fine-tune checkpoint'.format(
                 checkpoint_path))
         if checkpoint.get('adapter_type') != 'parallel_dora_dora1':
             raise ValueError('{} is not a DoRA+DoRA1 checkpoint'.format(
@@ -244,6 +248,7 @@ def evaluate(model, data_dir, args, device, description,
         num_workers=args.num_workers, pin_memory=device.type == 'cuda')
 
     errors = []
+    domain_errors = {'day': [], 'night': []}
     routing_rows = []
     route_counts = {'dora1': 0, 'dora': 0}
     router_correct = 0
@@ -278,6 +283,7 @@ def evaluate(model, data_dir, args, device, description,
             )
             error = count.item() - predicted
             errors.append(error)
+            domain_errors[expected_domain].append(error)
             if router_mode != 'fixed':
                 routing_rows.append({
                     'domain': domain or '',
@@ -303,7 +309,14 @@ def evaluate(model, data_dir, args, device, description,
         'router_accuracy': (router_correct / len(errors)
                             if router_mode != 'fixed' else None),
         'routing_rows': routing_rows,
+        'domain_metrics': {key: error_metrics(values) for key, values in domain_errors.items() if values},
     }
+
+
+def error_metrics(errors):
+    values = np.asarray(errors, dtype=np.float64)
+    return dict(images=len(values), mae=float(np.abs(values).mean()),
+                rmse=float(np.sqrt(np.square(values).mean())))
 
 
 def print_results(rows):
@@ -329,7 +342,7 @@ def write_routing_results(rows, output_path):
     parent = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(parent, exist_ok=True)
     fields = [
-        'domain', 'split', 'image', 'expected_domain', 'detected_domain',
+        'model', 'domain', 'split', 'image', 'expected_domain', 'detected_domain',
         'route', 'confidence', 'router_correct', 'ground_truth_count',
         'predicted_count', 'error', 'absolute_error',
     ]
@@ -339,12 +352,72 @@ def write_routing_results(rows, output_path):
         writer.writerows(rows)
 
 
+def evaluate_finetune_comparison(args, device):
+    if args.router_mode == 'fixed':
+        raise ValueError('Fine-tune evaluation requires classifier or filename routing')
+    checkpoint = load_checkpoint(args.finetune_checkpoint)
+    if checkpoint.get('stage') != 'finetune':
+        raise ValueError('--finetune-checkpoint must be a fine-tune checkpoint')
+    config = checkpoint['config']
+    if config['router_mode'] != args.router_mode:
+        raise ValueError('Router mode differs from fine-tune training')
+    router = None
+    if args.router_mode == 'classifier':
+        import hashlib
+        digest = hashlib.sha256()
+        with open(args.router_checkpoint, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        if digest.hexdigest() != config['router_digest']:
+            raise ValueError('Router weights differ from fine-tune training')
+        router = load_day_night_router(args.router_checkpoint).to(device).eval()
+        router.requires_grad_(False)
+    # Keep .pth metadata defaults consistent for the pre-fine-tune model too.
+    for key in ('model_name', 'dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
+        setattr(args, key, checkpoint[key])
+    before = args.dora1_checkpoint or checkpoint['origin']
+    checkpoints = [('after', args.finetune_checkpoint)]
+    if args.compare_before_after:
+        import hashlib
+        digest = hashlib.sha256()
+        with open(before, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        if digest.hexdigest() != checkpoint['origin_digest']:
+            raise ValueError('Before checkpoint differs from the fine-tune source')
+        checkpoints.insert(0, ('before', before))
+    rows, details = [], []
+    for label, path in checkpoints:
+        model = build_dual_dora_model(args, path).to(device).eval()
+        metrics = evaluate(model, os.path.join(args.data_root, 'mix', args.split),
+                           args, device, label + ' mix', router_mode=args.router_mode,
+                           image_router=router, domain='mix')
+        print('{} router accuracy: {:.2%}'.format(label, metrics['router_accuracy']))
+        for domain, values in dict(mix=metrics, **metrics['domain_metrics']).items():
+            rows.append(dict(model=label, domain=domain, split=args.split,
+                             checkpoint=path, **{key: values[key] for key in
+                                                ('images', 'mae', 'rmse')}))
+        for row in metrics['routing_rows']:
+            row['model'] = label
+            details.append(row)
+        del model
+    print_results(rows)
+    write_results(rows, args.output_csv)
+    write_routing_results(details, args.routing_csv)
+
+
 def main():
     args = parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rows = []
     routing_rows = []
+
+    if args.finetune_checkpoint:
+        evaluate_finetune_comparison(args, device)
+        return
+    if args.compare_before_after:
+        raise ValueError('--compare-before-after requires --finetune-checkpoint')
 
     if args.router_mode in ('filename', 'classifier'):
         if not args.dora1_checkpoint:

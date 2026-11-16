@@ -24,7 +24,7 @@ class Bay_Loss(Module):
                 pre_count = torch.sum(pre_density[idx].view((1, -1)) * prob, dim=1)  # flatten into vector
 
             res = torch.abs(target - pre_count)
-            num = ceil(0.9 * (len(res) - 1))
+            num = ceil(0.8 * (len(res) - 1))
             loss += torch.sum(torch.topk(res[:-1], num, largest=False)[0])
             loss += res[-1]
         loss = loss / len(prob_list)

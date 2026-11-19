@@ -36,7 +36,7 @@ def seed_worker(worker_id):
 
 def load_checkpoint(path):
     try:
-        return torch.load(path, map_location='cpu', mmap=True)
+        return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
     except TypeError:
         return torch.load(path, map_location='cpu')
 
@@ -59,7 +59,10 @@ class RegTrainer(Trainer):
     def setup(self):
         """initial the datasets, model, loss and optimizer"""
         args = self.args
-        if torch.cuda.is_available():
+        if args.device == 'cpu':
+            self.device, self.device_count = torch.device('cpu'), 1
+            logging.info('using CPU')
+        elif torch.cuda.is_available():
             self.device = torch.device("cuda")
             self.device_count = torch.cuda.device_count()
             # for code conciseness, we release the single gpu version

@@ -93,6 +93,8 @@ def routed_collate(batch):
 def backward_routed_batch(model, batch, device, post_prob, criterion, count_weight):
     """Accumulate sample-weighted gradients before one optimizer step."""
     inputs, points, targets, sizes, routes = batch
+    if not routes or any(route not in ('dora', 'dora1') for route in routes):
+        raise ValueError('Unknown fine-tune adapter route')
     inputs, sizes = inputs.to(device), sizes.to(device)
     points = [point.to(device) for point in points]
     targets = [target.to(device) for target in targets]
@@ -113,16 +115,48 @@ def backward_routed_batch(model, batch, device, post_prob, criterion, count_weig
             ).sum(dim=1).mean()
         count = count_l1_loss(density, group_targets)
         loss = bayesian + consistency + count_weight * count
+        if not torch.isfinite(loss):
+            raise FloatingPointError('Non-finite routed training loss')
         weight = len(indices) / len(routes)
         (loss * weight).backward()
         for key, value in zip(totals, (loss, bayesian, consistency, count)):
             totals[key] += value.detach().item() * weight
-    if any(route not in ('dora', 'dora1') for route in routes):
-        raise ValueError('Unknown fine-tune adapter route')
     return totals
 
 
 class FineTuneTrainer(Trainer):
+    @property
+    def stage_label(self):
+        return 'Fine-tune' if self.args.stage == 'finetune' else self.args.stage.title()
+
+    @property
+    def validation_router_mode(self):
+        return self.args.router_mode
+
+    def prepare_model(self, model_args, source, resumed):
+        source_state = resumed if resumed else load_training_checkpoint(source)
+        if 'model_state_dict' in source_state:
+            if source_state.get('stage') != ('finetune' if resumed else 'dora1'):
+                raise ValueError('Fine-tune must start from a completed DoRA1 checkpoint')
+            self.check_source_settings(source_state)
+        model = build_dual_dora_model(model_args, source)
+        model.enable_finetune()
+        return model
+
+    def check_source_settings(self, source_state):
+        for key in ('model_name', 'dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
+            if source_state.get(key) != getattr(self.args, key):
+                raise ValueError('Source checkpoint differs from --' + key.replace('_', '-'))
+
+    def configure_train_mode(self):
+        self.model.finetune_train_mode()
+
+    def checkpoint_metadata(self):
+        return {}
+
+    def extra_config(self):
+        return {}
+
     def __init__(self, args):
         if args.resume:
             if not os.path.isfile(args.resume):
@@ -137,12 +171,12 @@ class FineTuneTrainer(Trainer):
         args = self.args
         if args.downsample_ratio != 16:
             raise ValueError('Swin MAN density maps use --downsample-ratio 16')
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu')
         resumed = load_training_checkpoint(args.resume) if args.resume else None
         resume_keys = ('config', 'ranking', 'epoch', 'optimizer_state_dict', 'rng', 'global_step')
-        if resumed and (resumed.get('stage') != 'finetune'
+        if resumed and (resumed.get('stage') != args.stage
                         or any(key not in resumed for key in resume_keys)):
-            raise ValueError('Resume needs a fine-tune last_checkpoint.tar')
+            raise ValueError('Resume needs a matching-stage last_checkpoint.tar')
         if resumed:
             self.save_dir = os.path.dirname(os.path.abspath(args.resume))
         self.train_data = Crowd(args.finetune_train_dir, args.crop_size,
@@ -171,6 +205,7 @@ class FineTuneTrainer(Trainer):
                                        'losses/post_prob.py', 'utils/finetune_trainer.py')},
             schema_version=1,
         )
+        self.config.update(self.extra_config())
         if resumed:
             validate_resume_config(resumed['config'], self.config)
             if args.max_epoch < resumed['epoch']:
@@ -182,17 +217,8 @@ class FineTuneTrainer(Trainer):
         model_args = copy.copy(args)
         model_args.dual_route = 'dora1'
         source = args.resume or args.dora1_checkpoint
-        source_state = resumed if resumed else load_training_checkpoint(source)
-        if 'model_state_dict' in source_state:
-            if source_state.get('stage') != ('finetune' if resumed else 'dora1'):
-                raise ValueError('Fine-tune must start from a completed DoRA1 checkpoint')
-            for key in ('model_name', 'dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
-                if source_state.get(key) != getattr(args, key):
-                    raise ValueError('Source checkpoint differs from --' + key.replace('_', '-'))
-        del source_state
-        self.model = build_dual_dora_model(model_args, source).to(self.device)
-        self.model.enable_finetune()
-        logging.info('Fine-tune trainable parameters: %d / %d',
+        self.model = self.prepare_model(model_args, source, resumed).to(self.device)
+        logging.info('%s trainable parameters: %d / %d', self.stage_label,
                      sum(p.numel() for p in self.model.parameters() if p.requires_grad),
                      sum(p.numel() for p in self.model.parameters()))
         self.optimizer = torch.optim.Adam(
@@ -207,7 +233,9 @@ class FineTuneTrainer(Trainer):
         routes = []
         with torch.inference_mode():
             for path in tqdm(self.train_data.im_list, desc='Cache full-image routes'):
-                if self.router is None:
+                if self.validation_router_mode == 'fixed':
+                    route = 'dora'
+                elif self.router is None:
                     route = route_from_filename(path)[1]
                 else:
                     with Image.open(path) as image:
@@ -246,22 +274,27 @@ class FineTuneTrainer(Trainer):
     def weights(self, epoch):
         metadata = {key: getattr(self.args, key) for key in
                     ('model_name', 'dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha')}
-        return dict(metadata, stage='finetune', adapter_type='parallel_dora_dora1',
+        return dict(metadata, stage=self.args.stage, adapter_type='parallel_dora_dora1',
                     epoch=epoch, model_state_dict=self.model.state_dict(),
-                    config=self.config, origin=self.origin, origin_digest=self.origin_digest)
+                    config=self.config, origin=self.origin, origin_digest=self.origin_digest,
+                    **self.checkpoint_metadata())
 
     def validate_and_save(self, epoch):
         self.model.eval()
+        if self.validation_router_mode == 'fixed':
+            self.model.set_adapter_route('dora')
         metrics = evaluate(self.model, self.args.finetune_val_dir, self.eval_args,
-                           self.device, 'Fine-tune val epoch {}'.format(epoch),
-                           router_mode=self.args.router_mode, image_router=self.router,
+                           self.device, '{} val epoch {}'.format(self.stage_label, epoch),
+                           router_mode=self.validation_router_mode, image_router=self.router,
                            domain='mix')
         for domain, values in dict(mix=metrics, **metrics['domain_metrics']).items():
             for key in ('mae', 'rmse'):
                 self.writer.add_scalar('val/{}/{}'.format(domain, key), values[key], epoch)
         score = metrics['mae'] + 2 * metrics['rmse']
-        logging.info('Fine-tune epoch %d MAE %.4f RMSE %.4f score %.4f',
-                     epoch, metrics['mae'], metrics['rmse'], score)
+        logging.info('%s epoch %d MAE %.4f RMSE %.4f score %.4f',
+                     self.stage_label, epoch, metrics['mae'], metrics['rmse'], score)
+        if hasattr(self.model, 'night_fusion'):
+            self.writer.add_scalar('train/fusion_alpha', self.model.night_fusion.alpha.item(), epoch)
         ranking = ranked_candidates(self.ranking, epoch, metrics['mae'], metrics['rmse'])
         if any(row['epoch'] == epoch for row in ranking):
             atomic_save(self.weights(epoch), os.path.join(
@@ -298,10 +331,10 @@ class FineTuneTrainer(Trainer):
             if self.completed_epoch == -1:
                 self.validate_and_save(0)
             for epoch in range(self.completed_epoch + 1, self.args.max_epoch + 1):
-                self.model.finetune_train_mode()
+                self.configure_train_mode()
                 totals = dict(total=0., bayesian=0., consistency=0., count=0.)
                 seen = 0
-                for batch in tqdm(self.loader, desc='Fine-tune epoch {}'.format(epoch)):
+                for batch in tqdm(self.loader, desc='{} epoch {}'.format(self.stage_label, epoch)):
                     self.optimizer.zero_grad(set_to_none=True)
                     values = backward_routed_batch(
                         self.model, batch, self.device, self.post_prob,
@@ -316,8 +349,8 @@ class FineTuneTrainer(Trainer):
                     self.global_step += 1
                 for key, value in totals.items():
                     self.writer.add_scalar('train/' + key, value / seen, epoch)
-                logging.info('Fine-tune epoch %d train total %.6f Bayesian %.6f '
-                             'consistency %.6f count L1 %.6f', epoch,
+                logging.info('%s epoch %d train total %.6f Bayesian %.6f '
+                             'consistency %.6f count L1 %.6f', self.stage_label, epoch,
                              *(totals[key] / seen for key in totals))
                 self.validate_and_save(epoch)
             self.best_model_path = os.path.join(self.save_dir, self.ranking[0]['filename'])

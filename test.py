@@ -35,6 +35,8 @@ def parse_args():
                         help='optional parallel DoRA/DoRA1 checkpoint')
     parser.add_argument('--finetune-checkpoint', default='',
                         help='fine-tune ranked .pth or last_checkpoint.tar')
+    parser.add_argument('--parallel-checkpoint', default='',
+                        help='metadata-bearing fusion/joint .pth or last_checkpoint.tar')
     parser.add_argument('--compare-before-after', action='store_true',
                         help='compare --dora1-checkpoint with --finetune-checkpoint')
     parser.add_argument('--dual-route', choices=['dora', 'dora1'], default='dora1',
@@ -58,7 +60,7 @@ def parse_args():
     parser.add_argument(
         '--routing-csv', default='routing_results.csv',
         help='per-image results written when a router is used')
-    parser.add_argument('--device', default='0')
+    parser.add_argument('--device', default='0', help='GPU index or cpu')
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--crop-size', type=int, default=384)
     parser.add_argument('--downsample-ratio', type=int, default=16)
@@ -168,7 +170,7 @@ def build_dual_dora_model(args, checkpoint_path):
         if checkpoint.get('model_name', args.model_name) != args.model_name:
             raise ValueError(
                 '{} model name does not match --model-name'.format(checkpoint_path))
-        if checkpoint.get('stage') not in ('dora1', 'finetune'):
+        if checkpoint.get('stage') not in ('dora1', 'finetune', 'fusion', 'joint'):
             raise ValueError('{} is not a DoRA1/fine-tune checkpoint'.format(
                 checkpoint_path))
         if checkpoint.get('adapter_type') != 'parallel_dora_dora1':
@@ -202,6 +204,13 @@ def build_dual_dora_model(args, checkpoint_path):
     model.enable_dual_dora(
         dora_rank, dora_alpha, dora1_rank, dora1_alpha,
         active_route=args.dual_route)
+    contains_night = any(key.startswith('night_') for key in state)
+    if checkpoint.get('stage') in ('fusion', 'joint'):
+        if (not contains_night or checkpoint.get('architecture') != 'swin_man_night_pfa_mdc_v1'
+                or checkpoint.get('output_stride') != 16):
+            raise ValueError('Parallel checkpoint needs complete stride-16 MAN fusion weights')
+    if contains_night:
+        model.enable_night_fusion()
     model.load_state_dict(state)
     model.set_adapter_route(args.dual_route)
     return model
@@ -320,18 +329,18 @@ def error_metrics(errors):
 
 
 def print_results(rows):
-    print('\n{:<10} {:<8} {:>8} {:>12} {:>12}'.format(
-        'Model', 'Domain', 'Images', 'MAE', 'RMSE'))
+    print('\n{:<10} {:<8} {:<8} {:>8} {:>12} {:>12}'.format(
+        'Model', 'Domain', 'Subset', 'Images', 'MAE', 'RMSE'))
     print('-' * 54)
     for row in rows:
-        print('{model:<10} {domain:<8} {images:>8d} '
-              '{mae:>12.3f} {rmse:>12.3f}'.format(**row))
+        print('{model:<10} {domain:<8} {subset:<8} {images:>8d} '
+              '{mae:>12.3f} {rmse:>12.3f}'.format(**dict(row, subset=row.get('subset', 'overall'))))
 
 
 def write_results(rows, output_path):
     parent = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(parent, exist_ok=True)
-    fields = ['model', 'domain', 'split', 'images', 'mae', 'rmse', 'checkpoint']
+    fields = ['model', 'domain', 'subset', 'split', 'images', 'mae', 'rmse', 'checkpoint']
     with open(output_path, 'w', newline='', encoding='utf-8') as output_file:
         writer = csv.DictWriter(output_file, fieldnames=fields)
         writer.writeheader()
@@ -406,13 +415,74 @@ def evaluate_finetune_comparison(args, device):
     write_routing_results(details, args.routing_csv)
 
 
+def evaluate_parallel(args, device):
+    """Evaluate both branches with checkpoint metadata; optionally compare its source."""
+    checkpoint = load_checkpoint(args.parallel_checkpoint)
+    if checkpoint.get('stage') not in ('fusion', 'joint'):
+        raise ValueError('--parallel-checkpoint needs a fusion/joint training checkpoint')
+    for key in ('model_name', 'dora_rank', 'dora_alpha', 'dora1_rank', 'dora1_alpha'):
+        setattr(args, key, checkpoint[key])
+    if args.downsample_ratio != 16:
+        raise ValueError('Parallel MAN uses --downsample-ratio 16')
+    router = None
+    if checkpoint['stage'] == 'joint' and args.router_mode != 'fixed':
+        if args.router_mode != checkpoint['config']['router_mode']:
+            raise ValueError('Router mode differs from joint training')
+        if args.router_mode == 'classifier':
+            import hashlib
+            with open(args.router_checkpoint, 'rb') as source:
+                digest = hashlib.sha256(source.read()).hexdigest()
+            if digest != checkpoint['config']['router_digest']:
+                raise ValueError('Router weights differ from joint training')
+    if args.router_mode == 'classifier':
+        router = load_day_night_router(args.router_checkpoint).to(device).eval()
+        router.requires_grad_(False)
+    jobs = [('after', args.parallel_checkpoint)]
+    if args.compare_before_after:
+        import hashlib
+        before = args.dora1_checkpoint or checkpoint['origin']
+        with open(before, 'rb') as source:
+            digest = hashlib.sha256(source.read()).hexdigest()
+        if digest != checkpoint['origin_digest']:
+            raise ValueError('Before checkpoint differs from the parallel stage source')
+        jobs.insert(0, ('before', before))
+    rows, details = [], []
+    for label, path in jobs:
+        model = build_dual_dora_model(args, path).to(device).eval()
+        for domain in args.domains:
+            metrics = evaluate(model, os.path.join(args.data_root, domain, args.split),
+                               args, device, label + ' ' + domain,
+                               router_mode=args.router_mode, image_router=router, domain=domain)
+            groups = {'overall': metrics}
+            if domain == 'mix':
+                groups.update(metrics['domain_metrics'])
+            for subset, values in groups.items():
+                rows.append(dict(model=label, domain=domain, subset=subset, split=args.split,
+                                 checkpoint=path, **{k: values[k] for k in ('images', 'mae', 'rmse')}))
+            for row in metrics['routing_rows']:
+                row['model'] = label
+                details.append(row)
+            if metrics['router_accuracy'] is not None:
+                print('{} {} routes={} router accuracy={:.2%}'.format(
+                    label, domain, metrics['route_counts'], metrics['router_accuracy']))
+        del model
+    print_results(rows)
+    write_results(rows, args.output_csv)
+    write_routing_results(details, args.routing_csv)
+
+
 def main():
     args = parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.environ['CUDA_VISIBLE_DEVICES'] = '' if args.device == 'cpu' else args.device.strip()
+    device = torch.device('cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu')
     rows = []
     routing_rows = []
 
+    if args.parallel_checkpoint:
+        if args.finetune_checkpoint:
+            raise ValueError('Choose --parallel-checkpoint or --finetune-checkpoint')
+        evaluate_parallel(args, device)
+        return
     if args.finetune_checkpoint:
         evaluate_finetune_comparison(args, device)
         return

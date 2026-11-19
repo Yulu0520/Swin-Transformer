@@ -11,6 +11,7 @@ from .transformer_cosine_multibatch import (
     TransformerEncoderLayer,
 )
 from .swin_dora import add_swin_qv_dora
+from .night_fusion import NightPfaMdc, ResidualNightFusion
 from .swin_dual_dora import (
     DualQVDoRAAdapter,
     add_swin_qv_dual_dora,
@@ -88,6 +89,7 @@ class SwinTransMultiBatch(nn.Module):
         else:
             raise ValueError('Unknown Swin variant: {}'.format(variant))
         self.variant = variant
+        self.active_adapter_route = 'baseline'
         self.backbone_features = backbone.features
         self.backbone_norm = backbone.norm
 
@@ -121,7 +123,17 @@ class SwinTransMultiBatch(nn.Module):
         density_size = (input_h // 16, input_w // 16)
 
         # torchvision Swin features and norm use channels-last tensors.
-        x = self.backbone_features(x)
+        multiscale = None
+        if hasattr(self, 'night_branch') and self.active_adapter_route == 'dora':
+            stages = []
+            for index, layer in enumerate(self.backbone_features):
+                x = layer(x)
+                if index in (3, 5):
+                    stages.append(x.permute(0, 3, 1, 2).contiguous())
+            multiscale = self.night_branch(*stages)
+        else:
+            # Day/baseline never call PFA, MDC, projection or fusion.
+            x = self.backbone_features(x)
         x = self.backbone_norm(x)
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.feature_adapter(x)
@@ -136,6 +148,8 @@ class SwinTransMultiBatch(nn.Module):
         x = F.interpolate(
             x, size=density_size, mode="bilinear", align_corners=False
         )
+        if multiscale is not None:
+            x = self.night_fusion(x, multiscale)
         density = self.reg_layer_0(x)
         return torch.relu(density), consistency_features
 
@@ -143,7 +157,9 @@ class SwinTransMultiBatch(nn.Module):
         """Freeze the clean baseline and adapt all backbone attention Q/V."""
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        return add_swin_qv_dora(self.backbone_features, rank, alpha)
+        count = add_swin_qv_dora(self.backbone_features, rank, alpha)
+        self.active_adapter_route = 'dora'
+        return count
 
     def enable_dual_dora(
             self, dora_rank=4, dora_alpha=4.0,
@@ -155,6 +171,7 @@ class SwinTransMultiBatch(nn.Module):
             dora_rank, dora_alpha, dora1_rank, dora1_alpha,
             active_route=active_route,
         )
+        self.active_adapter_route = active_route
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         if trainable_route is not None:
@@ -171,7 +188,39 @@ class SwinTransMultiBatch(nn.Module):
 
     def set_adapter_route(self, route):
         """Select baseline, DoRA, or DoRA1 for every Swin Q/V projection."""
-        return set_swin_adapter_route(self.backbone_features, route)
+        count = set_swin_adapter_route(self.backbone_features, route)
+        self.active_adapter_route = route
+        return count
+
+    def enable_night_fusion(self, alpha=0.1):
+        """Attach optional night modules without changing existing MAN keys."""
+        if hasattr(self, 'night_branch'):
+            raise ValueError('Night fusion is already attached')
+        channels = (192, 384) if self.variant == 'tiny' else (384, 768)
+        reference = next(self.parameters())
+        self.night_branch = NightPfaMdc(channels).to(reference)
+        self.night_fusion = ResidualNightFusion(alpha).to(reference)
+
+    def enable_parallel_training(self, stage):
+        if stage not in ('fusion', 'joint') or not hasattr(self, 'night_branch'):
+            raise ValueError('Parallel training requires fusion/joint and night modules')
+        self.requires_grad_(False)
+        modules = ((self.night_branch, self.night_fusion) if stage == 'fusion' else
+                   (self.feature_adapter, self.encoder, self.reg_layer_0))
+        for module in modules:
+            module.requires_grad_(True)
+
+    def parallel_train_mode(self, stage):
+        """Train only the selected modules; all other modules stay in eval mode."""
+        self.eval()
+        if stage == 'fusion':
+            self.night_branch.train()
+            self.night_fusion.train()
+        elif stage == 'joint':
+            for module in (self.feature_adapter, self.encoder, self.reg_layer_0):
+                module.train()
+        else:
+            raise ValueError('Parallel training stage must be fusion or joint')
 
     def enable_finetune(self):
         """Train the shared MAN modules while keeping Swin and adapters fixed."""

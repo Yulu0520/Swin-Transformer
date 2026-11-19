@@ -19,15 +19,16 @@ def parse_args():
                         default='swin_t_trans',
                         help='Swin-L has 24 attention blocks; Swin-T has 12')
     parser.add_argument(
-        '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1', 'finetune'],
+        '--stage', choices=['all', 'both', 'baseline', 'dora', 'dora1', 'finetune',
+                            'fusion', 'joint', 'parallel'],
         default='dora1',
-        help='all: baseline->DoRA->DoRA1->finetune; both: baseline->DoRA')
+        help='all: baseline->DoRA->DoRA1->fusion->joint; parallel: fusion->joint')
     
     parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/day',
                         help='clean baseline root containing train/ and val/')
     
     parser.add_argument('--dora-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
-    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
+    parser.add_argument('--dora-val-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
 
     parser.add_argument('--dora1-train-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train',
                         help='DoRA1-stage training directory')
@@ -40,12 +41,24 @@ def parse_args():
                         help='trained DoRA .pth or .tar for DoRA1-only training')
     parser.add_argument('--dora1-checkpoint', default='',
                         help='best dual-DoRA checkpoint used to start fine-tuning')
-    parser.add_argument('--finetune-train-dir',
+    parser.add_argument('--fusion-checkpoint', default='',
+                        help='completed fusion checkpoint used to start joint training')
+    parser.add_argument('--fusion-train-dir',
+                        default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/train')
+    parser.add_argument('--fusion-val-dir',
+                        default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/night/val')
+    parser.add_argument('--fusion-epochs', type=int, default=50)
+    parser.add_argument('--fusion-lr', type=float, default=1e-4)
+    parser.add_argument('--fusion-alpha', type=float, default=0.1,
+                        help='initial learnable residual fusion strength')
+    parser.add_argument('--finetune-train-dir', '--joint-train-dir',
                         default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/train')
-    parser.add_argument('--finetune-val-dir',
+    parser.add_argument('--finetune-val-dir', '--joint-val-dir',
                         default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix/val')
     parser.add_argument('--finetune-lr', type=float, default=1e-7)
     parser.add_argument('--finetune-epochs', type=int, default=50)
+    parser.add_argument('--joint-lr', type=float, default=1e-7)
+    parser.add_argument('--joint-epochs', type=int, default=50)
     parser.add_argument('--router-mode', choices=['classifier', 'filename'], default='classifier')
     parser.add_argument('--router-checkpoint',
                         default='')
@@ -108,6 +121,24 @@ def parse_args():
                         help='weight of crop count L1; 0 restores the original objective')
     
     args = parser.parse_args()
+    if args.stage in ('fusion', 'parallel') and not (args.dora1_checkpoint or args.resume):
+        parser.error('--stage fusion/parallel needs --dora1-checkpoint or --resume')
+    if args.stage == 'parallel' and args.resume:
+        parser.error('Resume one stage explicitly with --stage fusion or --stage joint')
+    if args.stage == 'joint' and not (args.fusion_checkpoint or args.resume):
+        parser.error('--stage joint needs --fusion-checkpoint or --resume')
+    if args.stage in ('fusion', 'joint', 'parallel') and args.resume and not args.resume.endswith('.tar'):
+        parser.error('Parallel resume requires last_checkpoint.tar')
+    if args.fusion_epochs <= 0 or args.joint_epochs <= 0:
+        parser.error('Fusion/joint epochs must be positive')
+    if any(not math.isfinite(lr) or lr <= 0 for lr in (args.fusion_lr, args.joint_lr)):
+        parser.error('Fusion/joint learning rates must be finite and positive')
+    if not math.isfinite(args.fusion_alpha) or args.fusion_alpha < 0:
+        parser.error('--fusion-alpha must be finite and nonnegative')
+    if args.stage in ('fusion', 'joint', 'parallel', 'all') and args.downsample_ratio != 16:
+        parser.error('Parallel MAN uses --downsample-ratio 16')
+    if args.stage in ('joint', 'parallel', 'all') and args.router_mode == 'classifier' and not os.path.isfile(args.router_checkpoint):
+        parser.error('Joint training requires --router-checkpoint; or use --router-mode filename')
     if not math.isfinite(args.count_loss_weight) or args.count_loss_weight < 0:
         parser.error('--count-loss-weight must be finite and nonnegative')
     if args.stage == 'dora' and not (args.baseline_checkpoint or args.resume):
@@ -131,7 +162,7 @@ def parse_args():
         parser.error('batch size and downsample ratio must be positive; workers nonnegative')
     if args.tensorboard_log_interval <= 0:
         parser.error('--tensorboard-log-interval must be positive')
-    if args.stage in ('finetune', 'all') and args.is_gray:
+    if args.stage in ('finetune', 'fusion', 'joint', 'parallel', 'all') and args.is_gray:
         parser.error('fine-tune uses RGB inputs to match evaluation; omit --is-gray')
     for name, epochs, val_epoch, val_start in (
         ('pretrain', args.pretrain_epochs, args.pretrain_val_epoch,
@@ -184,23 +215,36 @@ def run_stage(args, stage, parent_checkpoint=''):
         stage_args.max_epoch = args.dora1_epochs
         stage_args.val_epoch = args.dora1_val_epoch
         stage_args.val_start = args.dora1_val_start
+    elif stage == 'fusion':
+        stage_args.max_epoch = args.fusion_epochs
+        stage_args.finetune_train_dir = args.fusion_train_dir
+        stage_args.finetune_val_dir = args.fusion_val_dir
+        # Stage 4 always trains/evaluates the night route, independently of names.
+        stage_args.router_mode = 'filename'
+    elif stage == 'joint':
+        stage_args.max_epoch = args.joint_epochs
+        stage_args.dora1_checkpoint = args.fusion_checkpoint
     else:
         stage_args.max_epoch = args.finetune_epochs
     stage_args.save_dir = os.path.join(args.save_dir, args.model_name, stage)
     stage_args.lr = {
         'baseline': args.lr, 'dora': args.dora_lr, 'dora1': args.dora1_lr,
         'finetune': args.finetune_lr,
+        'fusion': args.fusion_lr, 'joint': args.joint_lr,
     }[stage]
     if parent_checkpoint:
         if stage == 'dora':
             stage_args.baseline_checkpoint = parent_checkpoint
         elif stage == 'dora1':
             stage_args.dora_checkpoint = parent_checkpoint
-        elif stage == 'finetune':
+        elif stage in ('finetune', 'fusion', 'joint'):
             stage_args.dora1_checkpoint = parent_checkpoint
         stage_args.resume = ''
     seed_everything(stage_args.seed)
-    if stage == 'finetune':
+    if stage in ('fusion', 'joint'):
+        from utils.parallel_trainer import ParallelTrainer
+        trainer = ParallelTrainer(stage_args)
+    elif stage == 'finetune':
         from utils.finetune_trainer import FineTuneTrainer
         trainer = FineTuneTrainer(stage_args)
     else:
@@ -211,7 +255,15 @@ def run_stage(args, stage, parent_checkpoint=''):
 
 
 def run_pipeline(args):
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()
+    os.environ['CUDA_VISIBLE_DEVICES'] = '' if args.device == 'cpu' else args.device.strip()
+    if args.stage == 'parallel':
+        best_fusion = run_stage(args, 'fusion')
+        if not best_fusion:
+            raise RuntimeError('Fusion produced no best checkpoint')
+        gc.collect()
+        torch.cuda.empty_cache()
+        best_joint = run_stage(args, 'joint', parent_checkpoint=best_fusion)
+        return best_fusion, best_joint
     if args.stage in ('both', 'all'):
         best_baseline = run_stage(args, 'baseline')
         if not best_baseline:
@@ -226,8 +278,11 @@ def run_pipeline(args):
         best_dora1 = run_stage(args, 'dora1', parent_checkpoint=best_dora)
         gc.collect()
         torch.cuda.empty_cache()
-        best_finetune = run_stage(args, 'finetune', parent_checkpoint=best_dora1)
-        return best_baseline, best_dora, best_dora1, best_finetune
+        best_fusion = run_stage(args, 'fusion', parent_checkpoint=best_dora1)
+        gc.collect()
+        torch.cuda.empty_cache()
+        best_joint = run_stage(args, 'joint', parent_checkpoint=best_fusion)
+        return best_baseline, best_dora, best_dora1, best_fusion, best_joint
     return run_stage(args, args.stage)
 
 
